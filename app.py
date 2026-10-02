@@ -45,7 +45,7 @@ else:
 
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-FONT_NAME = os.environ.get("SUBTITLE_FONT_NAME", "Noto Sans Myanmar")
+FONT_NAME = os.environ.get("SUBTITLE_FONT_NAME", "Padauk")
 FONTS_DIR = os.environ.get(
     "FONTS_DIR",
     "/usr/share/fonts/truetype/noto"
