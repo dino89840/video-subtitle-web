@@ -1455,13 +1455,17 @@ def index():
 
 @app.route("/api/submit", methods=["POST"])
 def submit():
-    if not r2_is_configured():
-        return jsonify({
-            "error": (
-                "R2 storage is not configured. "
-                "Add the R2 variables in Railway."
-            )
-        }), 503
+    if not bunny_is_configured():
+    return jsonify({
+        "error": (
+            "Bunny storage is not configured. "
+            "Add BUNNY_STORAGE_ZONE, "
+            "BUNNY_STORAGE_PASSWORD, "
+            "BUNNY_STORAGE_HOSTNAME and "
+            "BUNNY_CDN_HOSTNAME in Railway."
+        )
+    }), 503
+
 
     video_url = request.form.get(
         "video_url",
@@ -1617,7 +1621,9 @@ def download(job_id):
             "error": "File is not ready"
         }), 409
 
-    object_key = status_data.get("output_key")
+    object_key = status_data.get(
+        "output_key"
+    )
 
     if not object_key:
         return jsonify({
@@ -1625,18 +1631,8 @@ def download(job_id):
         }), 404
 
     try:
-        download_url = get_r2_client().generate_presigned_url(
-            "get_object",
-            Params={
-                "Bucket": R2_BUCKET,
-                "Key": object_key,
-                "ResponseContentDisposition": (
-                    f'attachment; filename="'
-                    f'subtitled-{job_id}.mp4"'
-                ),
-                "ResponseContentType": "video/mp4",
-            },
-            ExpiresIn=DOWNLOAD_URL_EXPIRES,
+        download_url = bunny_cdn_url(
+            object_key
         )
     except Exception as exc:
         return jsonify({
@@ -1646,7 +1642,11 @@ def download(job_id):
             )
         }), 500
 
-    return redirect(download_url, code=302)
+    return redirect(
+        download_url,
+        code=302,
+    )
+
 
 
 @app.route("/api/jobs/<job_id>", methods=["DELETE"])
@@ -1685,7 +1685,8 @@ def delete_job(job_id):
 
     try:
         if object_key:
-            delete_r2_object(object_key)
+            delete_bunny_object
+(object_key)
 
         shutil.rmtree(
             job_dir,
