@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import base64
+import hashlib
 import html
 import ipaddress
 import json
@@ -9,16 +11,14 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
-import boto3
 import requests
-from boto3.s3.transfer import TransferConfig
-from botocore.config import Config
 from flask import (
     Flask,
     jsonify,
@@ -29,6 +29,15 @@ from flask import (
 
 
 app = Flask(__name__)
+
+MAX_SUBTITLE_MB = max(
+    1,
+    int(os.environ.get("MAX_SUBTITLE_MB", "10"))
+)
+
+app.config["MAX_CONTENT_LENGTH"] = (
+    MAX_SUBTITLE_MB * 1024 * 1024
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 JOBS_DIR = Path(
@@ -63,25 +72,67 @@ MAX_HISTORY_IDS = 20
 VALID_JOB_ID = re.compile(r"^[a-f0-9]{12}$")
 REDIRECT_CODES = {301, 302, 303, 307, 308}
 
-R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
-R2_SECRET_ACCESS_KEY = os.environ.get(
-    "R2_SECRET_ACCESS_KEY",
-    ""
+BUNNY_STORAGE_ZONE = os.environ.get(
+    "BUNNY_STORAGE_ZONE",
+    "",
 ).strip()
-R2_BUCKET = os.environ.get("R2_BUCKET", "").strip()
 
-JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
-R2_CLIENT = None
-R2_CLIENT_LOCK = threading.Lock()
+BUNNY_STORAGE_PASSWORD = os.environ.get(
+    "BUNNY_STORAGE_PASSWORD",
+    "",
+).strip()
 
-TRANSFER_CONFIG = TransferConfig(
-    multipart_threshold=16 * 1024 * 1024,
-    multipart_chunksize=16 * 1024 * 1024,
-    max_concurrency=2,
-    max_io_queue=2,
-    io_chunksize=1024 * 1024,
-    use_threads=True,
+BUNNY_STORAGE_HOSTNAME = os.environ.get(
+    "BUNNY_STORAGE_HOSTNAME",
+    "storage.bunnycdn.com",
+).strip()
+
+BUNNY_CDN_HOSTNAME = os.environ.get(
+    "BUNNY_CDN_HOSTNAME",
+    "",
+).strip()
+
+BUNNY_TOKEN_AUTH_KEY = os.environ.get(
+    "BUNNY_TOKEN_AUTH_KEY",
+    "",
+).strip()
+
+BUNNY_UPLOAD_RETRIES = max(
+    1,
+    int(os.environ.get("BUNNY_UPLOAD_RETRIES", "4")),
+)
+
+BUNNY_CONNECT_TIMEOUT = max(
+    5,
+    int(os.environ.get("BUNNY_CONNECT_TIMEOUT", "30")),
+)
+
+BUNNY_READ_TIMEOUT = max(
+    60,
+    int(os.environ.get("BUNNY_READ_TIMEOUT", "900")),
+)
+
+BUNNY_UPLOAD_CHUNK_MB = max(
+    1,
+    int(os.environ.get("BUNNY_UPLOAD_CHUNK_MB", "1")),
+)
+
+BUNNY_UPLOAD_CHUNK_SIZE = (
+    BUNNY_UPLOAD_CHUNK_MB * 1024 * 1024
+)
+
+BUNNY_RETRYABLE_STATUS_CODES = {
+    408,
+    425,
+    429,
+    500,
+    502,
+    503,
+    504,
+}
+
+JOB_SEMAPHORE = threading.BoundedSemaphore(
+    MAX_CONCURRENT_JOBS
 )
 
 
@@ -97,51 +148,96 @@ def valid_job_id(job_id):
     return bool(VALID_JOB_ID.fullmatch(job_id or ""))
 
 
-def r2_is_configured():
+def normalize_hostname(value):
+    value = (value or "").strip()
+
+    value = re.sub(
+        r"^https?://",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    )
+
+    return value.strip("/")
+
+
+BUNNY_STORAGE_HOSTNAME = normalize_hostname(
+    BUNNY_STORAGE_HOSTNAME
+)
+
+BUNNY_CDN_HOSTNAME = normalize_hostname(
+    BUNNY_CDN_HOSTNAME
+)
+
+
+def bunny_is_configured():
     return all([
-        R2_ACCOUNT_ID,
-        R2_ACCESS_KEY_ID,
-        R2_SECRET_ACCESS_KEY,
-        R2_BUCKET,
+        BUNNY_STORAGE_ZONE,
+        BUNNY_STORAGE_PASSWORD,
+        BUNNY_STORAGE_HOSTNAME,
+        BUNNY_CDN_HOSTNAME,
     ])
 
 
-def get_r2_client():
-    global R2_CLIENT
+def bunny_storage_headers():
+    return {
+        "AccessKey": BUNNY_STORAGE_PASSWORD,
+        "Accept": "application/json",
+    }
 
-    if R2_CLIENT is not None:
-        return R2_CLIENT
 
-    if not r2_is_configured():
-        raise RuntimeError(
-            "R2 is not configured. Add R2_ACCOUNT_ID, "
-            "R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET "
-            "to Railway Variables."
-        )
+def bunny_storage_url(object_key=""):
+    zone = quote(
+        BUNNY_STORAGE_ZONE,
+        safe="",
+    )
 
-    with R2_CLIENT_LOCK:
-        if R2_CLIENT is None:
-            R2_CLIENT = boto3.client(
-                service_name="s3",
-                endpoint_url=(
-                    f"https://{R2_ACCOUNT_ID}"
-                    ".r2.cloudflarestorage.com"
-                ),
-                aws_access_key_id=R2_ACCESS_KEY_ID,
-                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-                region_name="auto",
-                config=Config(
-                    retries={
-                        "max_attempts": 8,
-                        "mode": "adaptive",
-                    },
-                    connect_timeout=20,
-                    read_timeout=180,
-                    tcp_keepalive=True,
-                ),
-            )
+    clean_key = str(object_key or "").lstrip("/")
+    encoded_key = quote(clean_key, safe="/")
 
-    return R2_CLIENT
+    base_url = (
+        f"https://{BUNNY_STORAGE_HOSTNAME}/{zone}"
+    )
+
+    if not encoded_key:
+        return base_url + "/"
+
+    return f"{base_url}/{encoded_key}"
+
+
+def bunny_cdn_url(object_key):
+    encoded_key = quote(
+        str(object_key).lstrip("/"),
+        safe="/",
+    )
+
+    path = f"/{encoded_key}"
+    base_url = f"https://{BUNNY_CDN_HOSTNAME}{path}"
+
+    if not BUNNY_TOKEN_AUTH_KEY:
+        return base_url
+
+    expires = int(time.time()) + DOWNLOAD_URL_EXPIRES
+
+    token_input = (
+        f"{BUNNY_TOKEN_AUTH_KEY}"
+        f"{path}"
+        f"{expires}"
+    )
+
+    digest = hashlib.md5(
+        token_input.encode("utf-8")
+    ).digest()
+
+    token = base64.urlsafe_b64encode(
+        digest
+    ).decode("ascii").rstrip("=")
+
+    return (
+        f"{base_url}"
+        f"?token={quote(token, safe='')}"
+        f"&expires={expires}"
+    )
 
 
 def read_status_file(status_file):
@@ -557,43 +653,402 @@ def timestamp_to_seconds(value):
         return 0.0
 
 
-def delete_r2_object(object_key):
-    if not object_key or not r2_is_configured():
+def delete_bunny_object(object_key):
+    if not object_key or not bunny_is_configured():
         return
 
-    get_r2_client().delete_object(
-        Bucket=R2_BUCKET,
-        Key=object_key,
-    )
+    response = None
 
-
-def stream_ffmpeg_to_r2(
-    command,
-    job_id,
-    duration,
-    object_key,
-):
-    process = subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-    )
-
-    if process.stdout is None or process.stderr is None:
-        process.kill()
-        raise RuntimeError(
-            "Unable to open FFmpeg output streams"
+    try:
+        response = requests.delete(
+            bunny_storage_url(object_key),
+            headers=bunny_storage_headers(),
+            timeout=(
+                BUNNY_CONNECT_TIMEOUT,
+                120,
+            ),
         )
 
+        if response.status_code not in {
+            200,
+            204,
+            404,
+        }:
+            details = response.text[:500]
+
+            raise RuntimeError(
+                "Bunny delete failed: "
+                f"HTTP {response.status_code} "
+                f"{details}"
+            )
+
+    finally:
+        if response is not None:
+            response.close()
+
+
+def calculate_sha256(path):
+    digest = hashlib.sha256()
+
+    with Path(path).open("rb") as file_handle:
+        while True:
+            chunk = file_handle.read(
+                4 * 1024 * 1024
+            )
+
+            if not chunk:
+                break
+
+            digest.update(chunk)
+
+    return digest.hexdigest().upper()
+
+
+class UploadProgressReader:
+    def __init__(
+        self,
+        file_handle,
+        total_size,
+        callback,
+    ):
+        self.file_handle = file_handle
+        self.total_size = total_size
+        self.callback = callback
+        self.bytes_read = 0
+        self.last_update = 0.0
+
+    def __len__(self):
+        return self.total_size
+
+    def tell(self):
+        return self.bytes_read
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = BUNNY_UPLOAD_CHUNK_SIZE
+        else:
+            size = min(
+                size,
+                BUNNY_UPLOAD_CHUNK_SIZE,
+            )
+
+        data = self.file_handle.read(size)
+
+        if data:
+            self.bytes_read += len(data)
+
+            current_time = time.monotonic()
+
+            if (
+                current_time - self.last_update >= 1.0
+                or self.bytes_read >= self.total_size
+            ):
+                self.callback(
+                    self.bytes_read,
+                    self.total_size,
+                )
+                self.last_update = current_time
+
+        return data
+
+
+def parse_retry_after(response):
+    if response is None:
+        return None
+
+    value = response.headers.get(
+        "Retry-After",
+        "",
+    ).strip()
+
+    try:
+        return max(1, min(60, int(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def verify_bunny_upload(
+    object_key,
+    expected_size,
+):
+    last_error = None
+
+    for attempt in range(1, 4):
+        response = None
+
+        try:
+            headers = bunny_storage_headers()
+            headers["Range"] = "bytes=0-0"
+
+            response = requests.get(
+                bunny_storage_url(object_key),
+                headers=headers,
+                stream=True,
+                timeout=(
+                    BUNNY_CONNECT_TIMEOUT,
+                    120,
+                ),
+            )
+
+            if response.status_code not in {
+                200,
+                206,
+            }:
+                raise RuntimeError(
+                    "Bunny verification failed: "
+                    f"HTTP {response.status_code}"
+                )
+
+            remote_size = None
+
+            content_range = response.headers.get(
+                "Content-Range",
+                "",
+            )
+
+            range_match = re.search(
+                r"/(\d+)$",
+                content_range,
+            )
+
+            if range_match:
+                remote_size = int(
+                    range_match.group(1)
+                )
+            else:
+                content_length = (
+                    response.headers.get(
+                        "Content-Length",
+                        "",
+                    )
+                )
+
+                if content_length.isdigit():
+                    remote_size = int(content_length)
+
+            if remote_size is None:
+                raise RuntimeError(
+                    "Bunny did not return the uploaded "
+                    "file size"
+                )
+
+            if remote_size != expected_size:
+                raise RuntimeError(
+                    "Bunny upload size mismatch: "
+                    f"local={expected_size}, "
+                    f"remote={remote_size}"
+                )
+
+            return
+
+        except Exception as exc:
+            last_error = exc
+
+            if attempt < 3:
+                time.sleep(attempt * 2)
+
+        finally:
+            if response is not None:
+                response.close()
+
+    raise RuntimeError(
+        "Unable to verify Bunny upload: "
+        f"{last_error}"
+    )
+
+
+def upload_file_to_bunny(
+    file_path,
+    object_key,
+    job_id,
+):
+    file_path = Path(file_path)
+    file_size = file_path.stat().st_size
+
+    if file_size < 1000:
+        raise RuntimeError(
+            "Output video was not created correctly"
+        )
+
+    update_status(
+        job_id,
+        status="uploading",
+        progress=91,
+        upload_bytes=0,
+        upload_total=file_size,
+    )
+
+    checksum = calculate_sha256(file_path)
+    last_error = None
+
+    for attempt in range(
+        1,
+        BUNNY_UPLOAD_RETRIES + 1,
+    ):
+        response = None
+
+        update_status(
+            job_id,
+            status="uploading",
+            progress=92,
+            upload_attempt=attempt,
+            upload_retries=BUNNY_UPLOAD_RETRIES,
+            upload_bytes=0,
+            upload_total=file_size,
+        )
+
+        def progress_callback(sent, total):
+            ratio = (
+                sent / total
+                if total > 0
+                else 0
+            )
+
+            progress = 92 + int(
+                min(max(ratio, 0.0), 1.0) * 7
+            )
+
+            update_status(
+                job_id,
+                status="uploading",
+                progress=min(progress, 99),
+                upload_bytes=sent,
+                upload_total=total,
+                upload_attempt=attempt,
+            )
+
+        try:
+            with file_path.open("rb") as file_handle:
+                reader = UploadProgressReader(
+                    file_handle,
+                    file_size,
+                    progress_callback,
+                )
+
+                headers = bunny_storage_headers()
+                headers.update({
+                    "Content-Type": "video/mp4",
+                    "Content-Length": str(file_size),
+                    "Checksum": checksum,
+                })
+
+                response = requests.put(
+                    bunny_storage_url(object_key),
+                    headers=headers,
+                    data=reader,
+                    timeout=(
+                        BUNNY_CONNECT_TIMEOUT,
+                        BUNNY_READ_TIMEOUT,
+                    ),
+                )
+
+            if response.status_code != 201:
+                details = response.text[:700]
+
+                raise RuntimeError(
+                    "Bunny upload failed: "
+                    f"HTTP {response.status_code} "
+                    f"{details}"
+                )
+
+            update_status(
+                job_id,
+                status="verifying",
+                progress=99,
+                upload_bytes=file_size,
+                upload_total=file_size,
+            )
+
+            verify_bunny_upload(
+                object_key,
+                file_size,
+            )
+
+            return file_size
+
+        except Exception as exc:
+            last_error = exc
+
+            retryable = True
+
+            if response is not None:
+                status_code = response.status_code
+
+                if (
+                    status_code >= 400
+                    and status_code
+                    not in BUNNY_RETRYABLE_STATUS_CODES
+                ):
+                    retryable = False
+
+            if (
+                not retryable
+                or attempt >= BUNNY_UPLOAD_RETRIES
+            ):
+                break
+
+            retry_after = parse_retry_after(response)
+
+            delay = retry_after or min(
+                30,
+                2 ** (attempt - 1),
+            )
+
+            update_status(
+                job_id,
+                status="uploading",
+                progress=92,
+                upload_attempt=attempt,
+                upload_retry_in=delay,
+                upload_error=str(exc)[:500],
+            )
+
+            time.sleep(delay)
+
+        finally:
+            if response is not None:
+                response.close()
+
+    try:
+        delete_bunny_object(object_key)
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Bunny upload failed after "
+        f"{BUNNY_UPLOAD_RETRIES} attempts: "
+        f"{last_error}"
+    )
+
+
+def run_ffmpeg_to_file(
+    command,
+    output_path,
+    job_id,
+    duration,
+):
     recent_output = deque(maxlen=80)
 
-    def read_ffmpeg_status():
-        for raw_line in iter(process.stderr.readline, b""):
-            line = raw_line.decode(
-                "utf-8",
-                errors="replace",
-            ).strip()
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+
+    if process.stderr is None:
+        process.kill()
+
+        raise RuntimeError(
+            "Unable to read FFmpeg output"
+        )
+
+    try:
+        for raw_line in process.stderr:
+            line = raw_line.strip()
 
             if not line:
                 continue
@@ -608,20 +1063,20 @@ def stream_ffmpeg_to_r2(
                         min(
                             encoded_seconds / duration,
                             1.0,
-                        ) * 80
+                        ) * 75
                     )
 
                     update_status(
                         job_id,
                         status="encoding",
-                        progress=min(progress, 95),
+                        progress=min(progress, 90),
                     )
 
             elif line == "progress=end":
                 update_status(
                     job_id,
-                    status="uploading",
-                    progress=97,
+                    status="encoding",
+                    progress=90,
                 )
 
             elif not re.match(
@@ -630,59 +1085,32 @@ def stream_ffmpeg_to_r2(
             ):
                 recent_output.append(line)
 
-    stderr_thread = threading.Thread(
-        target=read_ffmpeg_status,
-        daemon=True,
-        name=f"ffmpeg-status-{job_id}",
-    )
-    stderr_thread.start()
-
-    client = get_r2_client()
-
-    try:
-        client.upload_fileobj(
-            process.stdout,
-            R2_BUCKET,
-            object_key,
-            ExtraArgs={
-                "ContentType": "video/mp4",
-                "ContentDisposition": (
-                    f'attachment; filename="'
-                    f'subtitled-{job_id}.mp4"'
-                ),
-            },
-            Config=TRANSFER_CONFIG,
-        )
-
-        process.stdout.close()
         return_code = process.wait()
-        stderr_thread.join(timeout=10)
 
         if return_code != 0:
-            delete_r2_object(object_key)
-
             details = "\n".join(recent_output)
 
             raise RuntimeError(
-                f"FFmpeg failed with code {return_code}: "
+                f"FFmpeg failed with code "
+                f"{return_code}: "
                 f"{details[-1800:]}"
             )
 
-        metadata = client.head_object(
-            Bucket=R2_BUCKET,
-            Key=object_key,
-        )
+        output_path = Path(output_path)
 
-        size = int(metadata.get("ContentLength", 0))
+        if not output_path.exists():
+            raise RuntimeError(
+                "FFmpeg output file is missing"
+            )
 
-        if size < 1000:
-            delete_r2_object(object_key)
+        output_size = output_path.stat().st_size
 
+        if output_size < 1000:
             raise RuntimeError(
                 "Output video was not created correctly"
             )
 
-        return size
+        return output_size
 
     except Exception:
         if process.poll() is None:
@@ -693,28 +1121,20 @@ def stream_ffmpeg_to_r2(
         except subprocess.TimeoutExpired:
             process.kill()
 
-        try:
-            delete_r2_object(object_key)
-        except Exception:
-            pass
-
         raise
 
     finally:
-        try:
-            process.stdout.close()
-        except Exception:
-            pass
-
         try:
             process.stderr.close()
         except Exception:
             pass
 
 
+
 def encode_job(job_id, video_url, subtitle_path):
     job_dir = JOBS_DIR / job_id
     ass_path = job_dir / "subtitles.ass"
+    output_path = job_dir / "output.mp4"
     object_key = f"outputs/{job_id}.mp4"
 
     try:
@@ -742,7 +1162,9 @@ def encode_job(job_id, video_url, subtitle_path):
                 source_size=source_size,
             )
 
-            duration = probe_duration(safe_video_url)
+            duration = probe_duration(
+                safe_video_url
+            )
 
             update_status(
                 job_id,
@@ -751,7 +1173,9 @@ def encode_job(job_id, video_url, subtitle_path):
                 duration=duration,
             )
 
-            cues = parse_subtitles(subtitle_path)
+            cues = parse_subtitles(
+                subtitle_path
+            )
 
             if not cues:
                 raise ValueError(
@@ -759,17 +1183,26 @@ def encode_job(job_id, video_url, subtitle_path):
                     "in the uploaded file"
                 )
 
-            create_ass_subtitle(cues, ass_path)
-
-            ass_filter_path = escape_ffmpeg_filter_path(
-                ass_path
+            create_ass_subtitle(
+                cues,
+                ass_path,
             )
-            fonts_filter_path = escape_ffmpeg_filter_path(
-                FONTS_DIR
+
+            ass_filter_path = (
+                escape_ffmpeg_filter_path(
+                    ass_path
+                )
+            )
+
+            fonts_filter_path = (
+                escape_ffmpeg_filter_path(
+                    FONTS_DIR
+                )
             )
 
             subtitle_filter = (
-                f"subtitles=filename='{ass_filter_path}':"
+                f"subtitles=filename="
+                f"'{ass_filter_path}':"
                 f"fontsdir='{fonts_filter_path}'"
             )
 
@@ -782,6 +1215,7 @@ def encode_job(job_id, video_url, subtitle_path):
 
             command = [
                 "ffmpeg",
+                "-y",
                 "-hide_banner",
                 "-loglevel", "error",
 
@@ -792,7 +1226,8 @@ def encode_job(job_id, video_url, subtitle_path):
                 "-user_agent",
                 (
                     "Mozilla/5.0 (Linux; Android 13) "
-                    "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                    "AppleWebKit/537.36 "
+                    "Chrome/120 Safari/537.36"
                 ),
 
                 "-i", safe_video_url,
@@ -817,26 +1252,25 @@ def encode_job(job_id, video_url, subtitle_path):
                 "-avoid_negative_ts", "make_zero",
                 "-max_muxing_queue_size", "2048",
 
-                "-movflags",
-                (
-                    "+frag_keyframe"
-                    "+empty_moov"
-                    "+default_base_moof"
-                ),
-                "-frag_duration", "2000000",
+                "-movflags", "+faststart",
 
                 "-progress", "pipe:2",
                 "-nostats",
 
-                "-f", "mp4",
-                "pipe:1",
+                str(output_path),
             ]
 
-            output_size = stream_ffmpeg_to_r2(
+            run_ffmpeg_to_file(
                 command,
+                output_path,
                 job_id,
                 duration,
+            )
+
+            output_size = upload_file_to_bunny(
+                output_path,
                 object_key,
+                job_id,
             )
 
             update_status(
@@ -845,11 +1279,13 @@ def encode_job(job_id, video_url, subtitle_path):
                 progress=100,
                 output_key=object_key,
                 size=output_size,
+                upload_bytes=output_size,
+                upload_total=output_size,
             )
 
     except Exception as exc:
         try:
-            delete_r2_object(object_key)
+            delete_bunny_object(object_key)
         except Exception:
             pass
 
@@ -861,8 +1297,18 @@ def encode_job(job_id, video_url, subtitle_path):
         )
 
     finally:
-        Path(subtitle_path).unlink(missing_ok=True)
-        ass_path.unlink(missing_ok=True)
+        Path(subtitle_path).unlink(
+            missing_ok=True
+        )
+
+        ass_path.unlink(
+            missing_ok=True
+        )
+
+        output_path.unlink(
+            missing_ok=True
+        )
+
 
 
 def parse_created_time(value):
@@ -880,8 +1326,52 @@ def parse_created_time(value):
         return None
 
 
+def list_bunny_outputs():
+    if not bunny_is_configured():
+        return []
+
+    response = None
+
+    try:
+        response = requests.get(
+            bunny_storage_url("outputs/"),
+            headers=bunny_storage_headers(),
+            timeout=(
+                BUNNY_CONNECT_TIMEOUT,
+                120,
+            ),
+        )
+
+        if response.status_code == 404:
+            return []
+
+        if response.status_code != 200:
+            raise RuntimeError(
+                "Unable to list Bunny files: "
+                f"HTTP {response.status_code} "
+                f"{response.text[:500]}"
+            )
+
+        data = response.json()
+
+        if not isinstance(data, list):
+            raise RuntimeError(
+                "Invalid Bunny file list response"
+            )
+
+        return data
+
+    finally:
+        if response is not None:
+            response.close()
+
+
 def cleanup_old_jobs():
-    cutoff = now_utc() - timedelta(hours=JOB_TTL_HOURS)
+    cutoff = (
+        now_utc()
+        - timedelta(hours=JOB_TTL_HOURS)
+    )
+
     removed = 0
 
     if JOBS_DIR.exists():
@@ -909,11 +1399,15 @@ def cleanup_old_jobs():
             if created >= cutoff:
                 continue
 
-            object_key = status_data.get("output_key")
+            object_key = status_data.get(
+                "output_key"
+            )
 
             if object_key:
                 try:
-                    delete_r2_object(object_key)
+                    delete_bunny_object(
+                        object_key
+                    )
                 except Exception:
                     continue
 
@@ -921,47 +1415,37 @@ def cleanup_old_jobs():
                 job_dir,
                 ignore_errors=True,
             )
+
             removed += 1
 
-    if r2_is_configured():
-        client = get_r2_client()
-        continuation_token = None
+    if bunny_is_configured():
+        for item in list_bunny_outputs():
+            if item.get("IsDirectory"):
+                continue
 
-        while True:
-            arguments = {
-                "Bucket": R2_BUCKET,
-                "Prefix": "outputs/",
-                "MaxKeys": 1000,
-            }
+            object_name = str(
+                item.get("ObjectName", "")
+            ).strip()
 
-            if continuation_token:
-                arguments["ContinuationToken"] = (
-                    continuation_token
-                )
+            if not object_name:
+                continue
 
-            response = client.list_objects_v2(**arguments)
-
-            for item in response.get("Contents", []):
-                modified = item.get("LastModified")
-
-                if modified and modified < cutoff:
-                    client.delete_object(
-                        Bucket=R2_BUCKET,
-                        Key=item["Key"],
-                    )
-                    removed += 1
-
-            if not response.get("IsTruncated"):
-                break
-
-            continuation_token = response.get(
-                "NextContinuationToken"
+            changed = parse_created_time(
+                item.get("LastChanged")
+                or item.get("DateCreated")
             )
 
-            if not continuation_token:
-                break
+            if changed is None or changed >= cutoff:
+                continue
+
+            delete_bunny_object(
+                f"outputs/{object_name}"
+            )
+
+            removed += 1
 
     return removed
+
 
 
 @app.route("/")
