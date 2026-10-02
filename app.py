@@ -19,6 +19,7 @@ from pathlib import Path
 from urllib.parse import quote, urljoin, urlparse
 
 import requests
+from PIL import Image, ImageDraw, ImageFont
 from flask import (
     Flask,
     jsonify,
@@ -387,6 +388,106 @@ def escape_ass_text(text):
     text = text.replace("{", r"\{")
     text = text.replace("}", r"\}")
     return text
+
+
+# --- PNG subtitle rendering (PIL + RAQM for correct Myanmar shaping) ---
+# Replaces libass/ASS which cannot shape Myanmar medial signs correctly.
+
+PADAUK_BOLD = "/usr/share/fonts/truetype/padauk/Padauk-Bold.ttf"
+PADAUK_REGULAR = "/usr/share/fonts/truetype/padauk/Padauk-Regular.ttf"
+DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+SUBTITLE_FONT_SIZE = 48  # Normal cinema subtitle size for 720p
+
+
+def _is_myanmar(char):
+    return "\u1000" <= char <= "\u109F"
+
+
+def _get_font_for_text(text, size):
+    """Pick font based on script: Padauk for Myanmar, DejaVu for Latin."""
+    has_mm = any(_is_myanmar(c) for c in text)
+    if has_mm:
+        path = PADAUK_BOLD if Path(PADAUK_BOLD).exists() else DEJAVU_BOLD
+    else:
+        path = DEJAVU_BOLD
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def render_subtitle_png(text_lines, output_path, video_width=1280):
+    """Render subtitle cue as transparent PNG with black backing box."""
+    font = _get_font_for_text(" ".join(text_lines), SUBTITLE_FONT_SIZE)
+
+    # Measure text
+    tmp_img = Image.new("RGBA", (10, 10))
+    tmp_draw = ImageDraw.Draw(tmp_img)
+    line_heights = []
+    line_widths = []
+    for line in text_lines:
+        bbox = tmp_draw.textbbox((0, 0), line, font=font)
+        line_widths.append(bbox[2] - bbox[0])
+        line_heights.append(bbox[3] - bbox[1])
+
+    max_w = max(line_widths) if line_widths else 10
+    total_h = sum(line_heights) + (len(text_lines) - 1) * 8
+
+    pad_x, pad_y = 24, 14
+    img_w = min(max_w + pad_x * 2, video_width - 40)
+    img_h = total_h + pad_y * 2
+
+    img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    # Semi-transparent black backing box
+    draw.rounded_rectangle(
+        [(0, 0), (img_w - 1, img_h - 1)],
+        radius=12,
+        fill=(0, 0, 0, 160),
+    )
+
+    # Draw text lines centered
+    y = pad_y
+    for i, line in enumerate(text_lines):
+        lw = line_widths[i]
+        x = (img_w - lw) // 2
+        # White text with subtle outline for readability
+        draw.text(
+            (x, y), line, font=font, fill=(255, 255, 255, 255),
+            stroke_width=2, stroke_fill=(0, 0, 0, 200),
+        )
+        y += line_heights[i] + 8
+
+    img.save(output_path)
+    return output_path
+
+
+def render_all_subtitles(cues, png_dir, video_width=1280):
+    """Render all cues to PNGs. Returns [(png_path, start, end), ...]."""
+    png_dir.mkdir(parents=True, exist_ok=True)
+    result = []
+    for idx, (start, end, text_lines) in enumerate(cues):
+        png_path = png_dir / f"cue_{idx:04d}.png"
+        render_subtitle_png(text_lines, str(png_path), video_width)
+        result.append((str(png_path), start, end))
+    return result
+
+
+def run_ffmpeg_simple(command, label):
+    """Run ffmpeg without progress tracking (for segments)."""
+    result = subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        err = result.stderr[-1500:] if result.stderr else "unknown"
+        raise RuntimeError(f"{label} failed: {err}")
+    return True
+
 
 
 def create_ass_subtitle(cues, output_path):
@@ -1131,6 +1232,50 @@ def run_ffmpeg_to_file(
 
 
 
+def _download_video_to_file(url, dest_path, job_id):
+    """Download remote video to local file with progress."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 13) "
+            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        ),
+    }
+    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length", 0))
+        done = 0
+        with open(dest_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    done += len(chunk)
+                    if total > 0:
+                        pct = 13 + int(2 * done / total)
+                        if pct % 2 == 0:
+                            update_status(
+                                job_id, status="downloading",
+                                progress=min(pct, 15),
+                            )
+
+
+def _probe_video_width(video_path):
+    """Get video width via ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width",
+                "-of", "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        return int(result.stdout.strip())
+    except Exception:
+        return None
+
+
 def encode_job(job_id, video_url, subtitle_path):
     job_dir = JOBS_DIR / job_id
     ass_path = job_dir / "subtitles.ass"
@@ -1183,28 +1328,25 @@ def encode_job(job_id, video_url, subtitle_path):
                     "in the uploaded file"
                 )
 
-            create_ass_subtitle(
-                cues,
-                ass_path,
+            # --- PNG subtitle rendering (correct Myanmar shaping) ---
+            update_status(
+                job_id,
+                status="rendering",
+                progress=12,
+                total_cues=len(cues),
             )
 
-            ass_filter_path = (
-                escape_ffmpeg_filter_path(
-                    ass_path
-                )
-            )
+            # Download video to disk for segment processing
+            input_path = job_dir / "input.mp4"
+            update_status(job_id, status="downloading", progress=13)
+            _download_video_to_file(safe_video_url, input_path, job_id)
 
-            fonts_filter_path = (
-                escape_ffmpeg_filter_path(
-                    FONTS_DIR
-                )
-            )
+            # Get video dimensions for PNG sizing
+            video_width = _probe_video_width(input_path) or 1280
 
-            subtitle_filter = (
-                f"subtitles=filename="
-                f"'{ass_filter_path}':"
-                f"fontsdir='{fonts_filter_path}'"
-            )
+            # Render all subtitle PNGs
+            png_dir = job_dir / "pngs"
+            png_files = render_all_subtitles(cues, png_dir, video_width)
 
             update_status(
                 job_id,
@@ -1213,59 +1355,127 @@ def encode_job(job_id, video_url, subtitle_path):
                 total_cues=len(cues),
             )
 
-            command = [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel", "error",
+            # Group cues: merge if gap < 2s, max 20 per group
+            # (keeps ffmpeg input count low)
+            MAX_GROUP = 20
+            groups = []
+            cur_group = []
+            for p, s, e in png_files:
+                if cur_group and (s - cur_group[-1][2] > 2.0
+                                  or len(cur_group) >= MAX_GROUP):
+                    groups.append(cur_group)
+                    cur_group = []
+                cur_group.append((p, s, e))
+            if cur_group:
+                groups.append(cur_group)
 
-                "-rw_timeout", "180000000",
-                "-reconnect", "1",
-                "-reconnect_streamed", "1",
-                "-reconnect_delay_max", "5",
-                "-user_agent",
-                (
-                    "Mozilla/5.0 (Linux; Android 13) "
-                    "AppleWebKit/537.36 "
-                    "Chrome/120 Safari/537.36"
-                ),
+            # Build timeline: alternate subtitle groups and gaps
+            seg_dir = job_dir / "segments"
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            pieces = []  # (start, end, png_list or None)
+            cursor = 0.0
+            for g in groups:
+                gs = g[0][1]
+                ge = g[-1][2]
+                if gs > cursor + 0.05:
+                    pieces.append((cursor, gs, None))
+                pieces.append((gs, ge, g))
+                cursor = ge
+            if cursor < duration - 0.05:
+                pieces.append((cursor, duration, None))
 
-                "-i", safe_video_url,
+            # Encode each piece
+            seg_files = []
+            total_pieces = len(pieces)
+            for idx, (ps, pe, plist) in enumerate(pieces):
+                pdur = pe - ps
+                if pdur <= 0:
+                    continue
+                seg_out = seg_dir / f"seg_{idx:04d}.mp4"
+                seg_files.append(str(seg_out))
 
-                "-map", "0:v:0",
-                "-map", "0:a:0?",
+                prog = 15 + int(70 * idx / max(total_pieces, 1))
+                update_status(
+                    job_id, status="encoding",
+                    progress=min(prog, 85),
+                )
 
-                "-vf", subtitle_filter,
+                if plist is None:
+                    # Gap: stream copy (fast, no re-encode)
+                    run_ffmpeg_simple([
+                        "ffmpeg", "-y", "-hide_banner",
+                        "-loglevel", "error",
+                        "-ss", f"{ps:.3f}",
+                        "-i", str(input_path),
+                        "-t", f"{pdur:.3f}",
+                        "-c", "copy",
+                        str(seg_out),
+                    ], f"gap {idx}")
+                else:
+                    # Two-step: extract raw, then burn PNGs
+                    raw_seg = seg_dir / f"raw_{idx:04d}.mp4"
+                    run_ffmpeg_simple([
+                        "ffmpeg", "-y", "-hide_banner",
+                        "-loglevel", "error",
+                        "-ss", f"{ps:.3f}",
+                        "-i", str(input_path),
+                        "-t", f"{pdur:.3f}",
+                        "-c", "copy",
+                        str(raw_seg),
+                    ], f"extract {idx}")
 
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "21",
-                "-pix_fmt", "yuv420p",
-                "-threads", "2",
+                    # Build overlay filter chain
+                    filter_parts = []
+                    prev = "[0:v]"
+                    png_inputs = []
+                    for j, (png_path, s, e) in enumerate(plist):
+                        rs = max(s - ps, 0)
+                        re_ = min(e - ps, pdur)
+                        png_inputs += ["-i", png_path]
+                        out = f"[s{j}]" if j < len(plist) - 1 else "[vout]"
+                        filter_parts.append(
+                            f"{prev}[{j+1}:v]overlay="
+                            f"x=(W-w)/2:y=H-h-60:"
+                            f"enable='between(t,{rs:.3f},{re_:.3f})'{out}"
+                        )
+                        prev = out
 
-                "-c:a", "aac",
-                "-b:a", "128k",
+                    run_ffmpeg_simple([
+                        "ffmpeg", "-y", "-hide_banner",
+                        "-loglevel", "error",
+                        "-i", str(raw_seg),
+                        *png_inputs,
+                        "-filter_complex", ";".join(filter_parts),
+                        "-map", "[vout]", "-map", "0:a?",
+                        "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "21", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "128k",
+                        str(seg_out),
+                    ], f"burn {idx} ({len(plist)} cues)")
+                    raw_seg.unlink(missing_ok=True)
 
-                "-fps_mode", "passthrough",
-                "-map_metadata", "-1",
-                "-map_chapters", "-1",
-                "-avoid_negative_ts", "make_zero",
-                "-max_muxing_queue_size", "2048",
+            # Concat all segments
+            update_status(job_id, status="encoding", progress=88)
+            concat_list = seg_dir / "concat.txt"
+            with open(concat_list, "w") as cf:
+                for sf in seg_files:
+                    cf.write(f"file '{sf}'\n")
 
+            run_ffmpeg_simple([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_list),
+                "-c", "copy",
                 "-movflags", "+faststart",
-
-                "-progress", "pipe:2",
-                "-nostats",
-
                 str(output_path),
-            ]
+            ], "concat")
 
-            run_ffmpeg_to_file(
-                command,
-                output_path,
-                job_id,
-                duration,
-            )
+            # Cleanup temp files to save disk
+            shutil.rmtree(png_dir, ignore_errors=True)
+            shutil.rmtree(seg_dir, ignore_errors=True)
+            input_path.unlink(missing_ok=True)
+
+            update_status(job_id, status="encoding", progress=90)
 
             output_size = upload_file_to_bunny(
                 output_path,
