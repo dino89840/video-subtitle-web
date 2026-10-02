@@ -459,18 +459,25 @@ def render_subtitle_png(text_lines, output_path, video_width=1280):
     # Limit to 3 lines max
     wrapped = wrapped[:3]
 
-    # Measure
+    # Measure (include stroke width + extra for Myanmar descenders)
+    STROKE = 3
     line_heights = []
     line_widths = []
+    line_tops = []  # bbox top offset for each line
     for line in wrapped:
-        bbox = tmp_draw.textbbox((0, 0), line, font=font)
+        bbox = tmp_draw.textbbox(
+            (0, 0), line, font=font,
+            stroke_width=STROKE,
+        )
         line_widths.append(bbox[2] - bbox[0])
         line_heights.append(bbox[3] - bbox[1])
+        line_tops.append(bbox[1])
 
     max_w = max(line_widths) if line_widths else 10
-    total_h = sum(line_heights) + (len(wrapped) - 1) * 6
+    # Extra 10px per line for deep Myanmar descenders
+    total_h = sum(h + 10 for h in line_heights) + (len(wrapped) - 1) * 6
 
-    pad = 8
+    pad = 10
     img_w = max_w + pad * 2
     img_h = total_h + pad * 2
 
@@ -482,12 +489,13 @@ def render_subtitle_png(text_lines, output_path, video_width=1280):
     for i, line in enumerate(wrapped):
         lw = line_widths[i]
         x = (img_w - lw) // 2
+        # Offset by -top so ascenders/descenders aren't clipped
         draw.text(
-            (x, y), line, font=font,
+            (x, y - line_tops[i]), line, font=font,
             fill=(255, 235, 59, 255),  # Yellow
-            stroke_width=3, stroke_fill=(0, 0, 0, 255),
+            stroke_width=STROKE, stroke_fill=(0, 0, 0, 255),
         )
-        y += line_heights[i] + 6
+        y += line_heights[i] + 10 + 6
 
     img.save(output_path)
     return output_path
