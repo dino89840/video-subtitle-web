@@ -202,64 +202,84 @@ def encode_job(job_id, video_url, sub_path, watermark_text=None):
             if i % 50 == 0:
                 set_status(progress=15 + int(10 * i / len(cues)))
 
-        # 4. Segmented encoding (low memory: small filter graph per run)
-        # Split video into 5-minute segments to keep ffmpeg memory low
-        # (Railway $5 free tier has limited RAM; 369-input filter crashes)
-        SEG_LEN = 300  # 5 minutes
-        num_segs = int((duration + SEG_LEN - 1) // SEG_LEN)
-        seg_files = []
-
+        # 4. Per-group encoding (minimal resources: 2-5 inputs per ffmpeg run)
+        # Railway $5 free tier: even 119 inputs hits "Resource temporarily unavailable"
+        # Strategy: group nearby cues, one ffmpeg run per group (few PNG inputs),
+        # stream-copy gaps, concat everything at the end.
         set_status(status="encoding", progress=25)
         seg_dir = job_dir / "segs"
         seg_dir.mkdir(exist_ok=True)
 
-        for seg_idx in range(num_segs):
-            seg_start = seg_idx * SEG_LEN
-            seg_end = min((seg_idx + 1) * SEG_LEN, duration)
-            seg_dur = seg_end - seg_start
+        # Group cues: merge if gap < 2 seconds
+        groups = []
+        cur_group = []
+        for p, s, e in png_files:
+            if cur_group and s - cur_group[-1][2] > 2.0:
+                groups.append(cur_group)
+                cur_group = []
+            cur_group.append((p, s, e))
+        if cur_group:
+            groups.append(cur_group)
 
-            # Find cues overlapping this segment, adjust to segment-relative time
-            seg_cues = [(p, max(s - seg_start, 0), min(e - seg_start, seg_dur))
-                        for p, s, e in png_files
-                        if s < seg_end and e > seg_start]
+        set_status(total_groups=len(groups))
 
-            seg_out = seg_dir / f"seg_{seg_idx:03d}.mp4"
+        # Build timeline: alternate between subtitle groups and gaps
+        # Each timeline piece: (start, end, png_list_or_None)
+        pieces = []
+        prev_end = 0
+        for g in groups:
+            gs = g[0][1]
+            ge = g[-1][2]
+            if gs > prev_end + 0.1:
+                pieces.append((prev_end, gs, None))  # gap: stream copy
+            pieces.append((gs, ge, g))  # subtitles: re-encode
+            prev_end = ge
+        if prev_end < duration - 0.1:
+            pieces.append((prev_end, duration, None))
 
-            if not seg_cues:
-                # No subtitles in this segment: stream copy (fast, no re-encode)
+        seg_files = []
+        for idx, (ps, pe, plist) in enumerate(pieces):
+            pdur = pe - ps
+            if pdur < 0.1:
+                continue
+            seg_out = seg_dir / f"seg_{idx:04d}.mp4"
+
+            if plist is None:
+                # Gap: stream copy (fast)
                 run_ffmpeg([
-                    "ffmpeg", "-y", "-ss", str(seg_start), "-i", str(video_path),
-                    "-t", str(seg_dur), "-c", "copy", str(seg_out)
-                ], f"segment {seg_idx} copy")
+                    "ffmpeg", "-y", "-ss", f"{ps:.3f}", "-i", str(video_path),
+                    "-t", f"{pdur:.3f}", "-c", "copy", str(seg_out)
+                ], f"gap {idx}")
             else:
-                # Burn this segment's subtitles (typically <60 overlays)
+                # Subtitles: few PNG inputs (typically 1-5)
                 filter_parts = []
                 prev = "[0:v]"
                 png_inputs = []
-                for j, (png_path, s, e) in enumerate(seg_cues):
-                    idx = j + 1
+                for j, (png_path, s, e) in enumerate(plist):
+                    rs = max(s - ps, 0)
+                    re_ = min(e - ps, pdur)
                     png_inputs += ["-i", png_path]
-                    out = f"[s{j}]" if j < len(seg_cues) - 1 else "[vout]"
+                    out = f"[s{j}]" if j < len(plist) - 1 else "[vout]"
                     filter_parts.append(
-                        f"{prev}[{idx}:v]overlay=x=(W-w)/2:y=H-h-60:"
-                        f"enable='between(t,{s:.3f},{e:.3f})'{out}"
+                        f"{prev}[{j+1}:v]overlay=x=(W-w)/2:y=H-h-60:"
+                        f"enable='between(t,{rs:.3f},{re_:.3f})'{out}"
                     )
                     prev = out
 
                 run_ffmpeg([
                     "ffmpeg", "-y",
-                    "-ss", str(seg_start), "-i", str(video_path),
+                    "-ss", f"{ps:.3f}", "-i", str(video_path),
                     *png_inputs,
-                    "-t", str(seg_dur),
+                    "-t", f"{pdur:.3f}",
                     "-filter_complex", ";".join(filter_parts),
                     "-map", "[vout]", "-map", "0:a?",
-                    "-c:v", "libx264", "-crf", "21", "-preset", "fast",
+                    "-c:v", "libx264", "-crf", "21", "-preset", "veryfast",
                     "-c:a", "aac", "-b:a", "128k",
                     str(seg_out)
-                ], f"segment {seg_idx} encode ({len(seg_cues)} subs)")
+                ], f"subs {idx} ({len(plist)} cues)")
 
             seg_files.append(seg_out)
-            set_status(progress=25 + int(65 * (seg_idx + 1) / num_segs))
+            set_status(progress=25 + int(65 * (idx + 1) / len(pieces)))
 
         # 5. Concat all segments (stream copy, no re-encode)
         set_status(status="merging", progress=92)
