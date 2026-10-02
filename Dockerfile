@@ -1,12 +1,12 @@
-# Railway Dockerfile - includes ffmpeg + Myanmar fonts   
 FROM python:3.12-slim
 
-# Install ffmpeg and fonts
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-noto \
     fonts-dejavu \
     fonts-sil-padauk \
+    ca-certificates \
+    fontconfig \
     && rm -rf /var/lib/apt/lists/* \
     && fc-cache -f
 
@@ -17,13 +17,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Verify fonts exist (fallback paths)
-RUN ls /usr/share/fonts/truetype/noto/NotoSansMyanmar-Bold.ttf \
-       /usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf \
-    || (echo "WARNING: fonts not found" && fc-list | grep -i myanmar | head -3)
+RUN mkdir -p /tmp/video-subtitle-jobs
 
 ENV PORT=5000
-ENV FONT_MM=/usr/share/fonts/truetype/noto/NotoSansMyanmar-Bold.ttf
-ENV FONT_LAT=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+ENV JOBS_DIR=/tmp/video-subtitle-jobs
+ENV SUBTITLE_FONT_NAME=Padauk
+ENV FONTS_DIR=/usr/share/fonts
+ENV JOB_TTL_HOURS=24
+ENV DOWNLOAD_URL_EXPIRES=21600
+ENV MAX_SOURCE_GB=10
+ENV MAX_CONCURRENT_JOBS=1
 
-CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 3600 app:app"]
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 0 --graceful-timeout 30 app:app"]
