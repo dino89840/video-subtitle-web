@@ -6,7 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     fonts-noto \
     fonts-dejavu \
+    wget \
     && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /usr/share/fonts/truetype/padauk \
+    && wget -q -O /usr/share/fonts/truetype/padauk/Padauk-Bold.ttf "https://github.com/silnrsi/font-padauk/raw/master/fonts/Padauk-Bold.ttf" \
+    && wget -q -O /usr/share/fonts/truetype/padauk/Padauk-Regular.ttf "https://github.com/silnrsi/font-padauk/raw/master/fonts/Padauk-Regular.ttf" \
     && fc-cache -f
 
 WORKDIR /app
