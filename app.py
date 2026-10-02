@@ -1685,8 +1685,7 @@ def delete_job(job_id):
 
     try:
         if object_key:
-            delete_bunny_object
-(object_key)
+            delete_bunny_object(object_key)
 
         shutil.rmtree(
             job_dir,
