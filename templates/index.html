@@ -295,8 +295,11 @@
       </a>
 
       <div class="hint" style="margin-top: 10px; margin-bottom: 0;">
-        Download file ကို 24 နာရီအကြာတွင် ဖျက်ပါမယ်။
-      </div>
+  Output file ကို 24 နာရီအကြာတွင် အလိုအလျောက်ဖျက်ပါမယ်။
+  Download ပြီးလျှင် History ထဲက “Delete Now” ကိုနှိပ်ပြီး
+  ချက်ချင်းဖျက်နိုင်ပါတယ်။
+</div>
+
     </div>
 
     <div class="error" id="errorDiv"></div>
@@ -321,12 +324,13 @@ let pollTimer = null;
 let historyTimer = null;
 
 const statusLabels = {
-  queued: 'စောင့်ဆိုင်းနေသည်',
-  downloading: 'Video download လုပ်နေသည်',
+  queued: 'Queue ထဲသို့ ထည့်ထားသည်',
+  waiting: 'အခြား encode ပြီးရန် စောင့်နေသည်',
+  checking: 'Remote URL စစ်ဆေးနေသည်',
   probing: 'Video အချက်အလက် စစ်နေသည်',
   preparing: 'Subtitle ပြင်ဆင်နေသည်',
-  encoding: 'Video encode လုပ်နေသည်',
-  finalizing: 'Video အပြီးသတ်နေသည်',
+  encoding: 'Video ကို stream encode လုပ်နေသည်',
+  uploading: 'Cloud storage သို့ အပြီးသတ်တင်နေသည်',
   done: 'ပြီးပါပြီ',
   error: 'Error ဖြစ်နေသည်',
   missing: 'File မရှိတော့ပါ'
@@ -381,6 +385,50 @@ function removeJobId(jobId) {
   }
 
   loadHistory();
+}
+async function deleteJob(jobId) {
+  const confirmed = window.confirm(
+    'ဒီ video ကို server နဲ့ cloud storage ကနေ ' +
+    'ချက်ချင်းဖျက်မှာ သေချာပါသလား။'
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const response = await fetch(
+      `/api/jobs/${encodeURIComponent(jobId)}`,
+      {
+        method: 'DELETE',
+        headers: {
+          'Accept': 'application/json'
+        }
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || data.error) {
+      throw new Error(
+        data.error || `HTTP ${response.status}`
+      );
+    }
+
+    removeJobId(jobId);
+
+    if (activeJobId === jobId) {
+      activeJobId = null;
+      clearTimeout(pollTimer);
+      hideMainProgress();
+      setButtonReady();
+    }
+
+    await loadHistory();
+
+  } catch (error) {
+    window.alert(`ဖျက်မရပါ: ${error.message}`);
+  }
 }
 
 function formatBytes(bytes) {
@@ -640,25 +688,50 @@ function renderHistory(jobs) {
     let actionHtml = '';
 
     if (status === 'done') {
-      actionHtml = `
-        <div class="history-actions">
-          <a
-            class="history-download"
-            href="/api/download/${encodeURIComponent(job.job_id)}"
-          >
-            ⬇ Download ${size ? `(${escapeHtml(size)})` : ''}
-          </a>
+  actionHtml = `
+    <div class="history-actions">
+      <a
+        class="history-download"
+        href="/api/download/${encodeURIComponent(job.job_id)}"
+      >
+        ⬇ Download ${size ? `(${escapeHtml(size)})` : ''}
+      </a>
 
-          <button
-            class="remove-button"
-            type="button"
-            onclick="removeJobId('${escapeHtml(job.job_id)}')"
-          >
-            History မှဖယ်မည်
-          </button>
-        </div>
-      `;
-    } else if (status === 'error' || status === 'missing') {
+      <button
+        class="remove-button"
+        type="button"
+        onclick="deleteJob('${escapeHtml(job.job_id)}')"
+      >
+        🗑 Delete Now
+      </button>
+    </div>
+  `;
+} else if (status === 'error') {
+  actionHtml = `
+    <div class="history-actions">
+      <button
+        class="remove-button"
+        type="button"
+        onclick="deleteJob('${escapeHtml(job.job_id)}')"
+      >
+        🗑 Error Job ဖျက်မည်
+      </button>
+    </div>
+  `;
+} else if (status === 'missing') {
+  actionHtml = `
+    <div class="history-actions">
+      <button
+        class="remove-button"
+        type="button"
+        onclick="removeJobId('${escapeHtml(job.job_id)}')"
+      >
+        History မှဖယ်မည်
+      </button>
+    </div>
+  `;
+}
+ else if (status === 'error' || status === 'missing') {
       actionHtml = `
         <div class="history-actions">
           <button
