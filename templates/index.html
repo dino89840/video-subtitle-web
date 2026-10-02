@@ -3,142 +3,780 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
 <title>Video Subtitle Burner</title>
+
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: sans-serif; background: #1a1a2e; color: #eee;
-         min-height: 100vh; padding: 20px; }
-  .container { max-width: 600px; margin: 0 auto; }
-  h1 { text-align: center; margin-bottom: 30px; color: #ffd700; }
-  .card { background: #16213e; border-radius: 12px; padding: 25px;
-          margin-bottom: 20px; }
-  label { display: block; margin-bottom: 8px; font-weight: bold; }
-  input[type=url], input[type=file] {
-    width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #333;
-    background: #0f0f23; color: #eee; margin-bottom: 20px; font-size: 16px;
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
   }
-  input[type=file] { cursor: pointer; }
-  button {
-    width: 100%; padding: 14px; border: none; border-radius: 8px;
-    background: #ffd700; color: #1a1a2e; font-size: 18px; font-weight: bold;
+
+  body {
+    font-family: Arial, "Noto Sans Myanmar", sans-serif;
+    background: #1a1a2e;
+    color: #eeeeee;
+    min-height: 100vh;
+    padding: 20px;
+  }
+
+  .container {
+    max-width: 650px;
+    margin: 0 auto;
+  }
+
+  h1 {
+    text-align: center;
+    margin-bottom: 30px;
+    color: #ffd700;
+    font-size: 28px;
+  }
+
+  h2 {
+    margin-bottom: 15px;
+    font-size: 20px;
+    color: #ffd700;
+  }
+
+  .card {
+    background: #16213e;
+    border-radius: 12px;
+    padding: 25px;
+    margin-bottom: 20px;
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
+  }
+
+  label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: bold;
+  }
+
+  input[type="url"],
+  input[type="file"] {
+    width: 100%;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid #333;
+    background: #0f0f23;
+    color: #eeeeee;
+    margin-bottom: 20px;
+    font-size: 16px;
+  }
+
+  input[type="file"] {
     cursor: pointer;
   }
-  button:disabled { background: #555; cursor: not-allowed; }
-  .progress { display: none; margin-top: 20px; }
-  .bar-bg { background: #0f0f23; border-radius: 8px; height: 24px; overflow: hidden; }
-  .bar { background: #ffd700; height: 100%; width: 0%; transition: width 0.5s;
-         border-radius: 8px; }
-  .status-text { text-align: center; margin-top: 10px; font-size: 16px; }
-  .download { display: none; text-align: center; margin-top: 20px; }
-  .download a {
-    display: inline-block; padding: 14px 40px; background: #4caf50;
-    color: white; text-decoration: none; border-radius: 8px;
-    font-size: 18px; font-weight: bold;
+
+  button {
+    width: 100%;
+    padding: 14px;
+    border: none;
+    border-radius: 8px;
+    background: #ffd700;
+    color: #1a1a2e;
+    font-size: 18px;
+    font-weight: bold;
+    cursor: pointer;
   }
-  .error { color: #ff6b6b; text-align: center; margin-top: 15px; }
-  .hint { font-size: 13px; color: #888; margin-top: -15px; margin-bottom: 20px; }
+
+  button:disabled {
+    background: #555555;
+    color: #cccccc;
+    cursor: not-allowed;
+  }
+
+  .progress {
+    display: none;
+    margin-top: 20px;
+  }
+
+  .bar-bg {
+    background: #0f0f23;
+    border-radius: 8px;
+    height: 24px;
+    overflow: hidden;
+  }
+
+  .bar {
+    background: #ffd700;
+    height: 100%;
+    width: 0%;
+    transition: width 0.5s;
+    border-radius: 8px;
+  }
+
+  .status-text {
+    text-align: center;
+    margin-top: 10px;
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  .download {
+    display: none;
+    text-align: center;
+    margin-top: 20px;
+  }
+
+  .download a,
+  .history-download {
+    display: inline-block;
+    padding: 12px 25px;
+    background: #4caf50;
+    color: white;
+    text-decoration: none;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: bold;
+  }
+
+  .error {
+    color: #ff6b6b;
+    text-align: center;
+    margin-top: 15px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .hint {
+    font-size: 13px;
+    color: #999999;
+    margin-top: -15px;
+    margin-bottom: 20px;
+    line-height: 1.5;
+  }
+
+  .history-empty {
+    color: #999999;
+    text-align: center;
+    padding: 15px 0;
+  }
+
+  .history-item {
+    background: #0f0f23;
+    border: 1px solid #2d3556;
+    border-radius: 10px;
+    padding: 15px;
+    margin-bottom: 12px;
+  }
+
+  .history-item:last-child {
+    margin-bottom: 0;
+  }
+
+  .history-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 8px;
+  }
+
+  .history-id {
+    color: #ffd700;
+    font-family: monospace;
+    font-size: 14px;
+  }
+
+  .history-status {
+    font-size: 14px;
+    color: #dddddd;
+  }
+
+  .history-date {
+    font-size: 12px;
+    color: #888888;
+    margin-bottom: 10px;
+  }
+
+  .mini-bar-bg {
+    height: 8px;
+    background: #292944;
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 10px;
+  }
+
+  .mini-bar {
+    height: 100%;
+    background: #ffd700;
+    border-radius: 10px;
+  }
+
+  .history-error {
+    color: #ff6b6b;
+    font-size: 13px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+
+  .remove-button {
+    width: auto;
+    padding: 7px 12px;
+    background: #842029;
+    color: white;
+    font-size: 13px;
+    margin-left: 8px;
+  }
+
+  .history-actions {
+    margin-top: 10px;
+  }
+
+  @media (max-width: 500px) {
+    body {
+      padding: 12px;
+    }
+
+    .card {
+      padding: 18px;
+    }
+
+    h1 {
+      font-size: 24px;
+    }
+
+    .history-row {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 4px;
+    }
+  }
 </style>
 </head>
+
 <body>
+
 <div class="container">
+
   <h1>🎬 Video Subtitle Burner</h1>
 
   <div class="card">
-    <label>Video URL (remote link)</label>
-    <input type="url" id="videoUrl" placeholder="https://example.com/video.mp4">
-    <div class="hint">Direct link to the video file (mp4)</div>
+    <label for="videoUrl">Video URL (remote link)</label>
 
-    <label>Subtitle File (VTT / SRT from your phone)</label>
-    <input type="file" id="subFile" accept=".vtt,.srt">
+    <input
+      type="url"
+      id="videoUrl"
+      placeholder="https://example.com/video.mp4"
+      autocomplete="url"
+    >
 
-    <button id="submitBtn" onclick="submitJob()">Encode Video</button>
+    <div class="hint">
+      Direct video file link ထည့်ပါ။ HTTP သို့မဟုတ် HTTPS link ဖြစ်ရမယ်။
+    </div>
+
+    <label for="subFile">Subtitle File (VTT / SRT)</label>
+
+    <input
+      type="file"
+      id="subFile"
+      accept=".vtt,.srt,text/vtt,application/x-subrip"
+    >
+
+    <button id="submitBtn" type="button">
+      Encode Video
+    </button>
 
     <div class="progress" id="progressDiv">
-      <div class="bar-bg"><div class="bar" id="bar"></div></div>
-      <div class="status-text" id="statusText">Starting...</div>
+      <div class="bar-bg">
+        <div class="bar" id="bar"></div>
+      </div>
+
+      <div class="status-text" id="statusText">
+        Starting...
+      </div>
     </div>
 
     <div class="download" id="downloadDiv">
-      <a id="downloadLink" href="#">⬇ Download Video</a>
-      <div class="hint" style="margin-top:10px">Link expires after 24 hours</div>
+      <a id="downloadLink" href="#">
+        ⬇ Download Video
+      </a>
+
+      <div class="hint" style="margin-top: 10px; margin-bottom: 0;">
+        Download file ကို 24 နာရီအကြာတွင် ဖျက်ပါမယ်။
+      </div>
     </div>
 
     <div class="error" id="errorDiv"></div>
   </div>
+
+  <div class="card">
+    <h2>ယခင်လုပ်ထားသော Videos</h2>
+    <div id="historyList">
+      <div class="history-empty">မရှိသေးပါ</div>
+    </div>
+  </div>
+
 </div>
 
 <script>
-let jobId = null;
+const JOB_STORAGE_KEY = 'videoSubtitleJobIdsV2';
+const URL_STORAGE_KEY = 'videoSubtitleLastUrlV2';
+const MAX_SAVED_JOBS = 20;
+
+let activeJobId = null;
 let pollTimer = null;
+let historyTimer = null;
+
+const statusLabels = {
+  queued: 'စောင့်ဆိုင်းနေသည်',
+  downloading: 'Video download လုပ်နေသည်',
+  probing: 'Video အချက်အလက် စစ်နေသည်',
+  preparing: 'Subtitle ပြင်ဆင်နေသည်',
+  encoding: 'Video encode လုပ်နေသည်',
+  finalizing: 'Video အပြီးသတ်နေသည်',
+  done: 'ပြီးပါပြီ',
+  error: 'Error ဖြစ်နေသည်',
+  missing: 'File မရှိတော့ပါ'
+};
+
+function getSavedJobIds() {
+  try {
+    const value = JSON.parse(
+      localStorage.getItem(JOB_STORAGE_KEY) || '[]'
+    );
+
+    if (!Array.isArray(value)) {
+      return [];
+    }
+
+    return value
+      .filter(id => typeof id === 'string')
+      .slice(0, MAX_SAVED_JOBS);
+  } catch (error) {
+    return [];
+  }
+}
+
+function setSavedJobIds(ids) {
+  const uniqueIds = [...new Set(ids)]
+    .slice(0, MAX_SAVED_JOBS);
+
+  localStorage.setItem(
+    JOB_STORAGE_KEY,
+    JSON.stringify(uniqueIds)
+  );
+}
+
+function saveJobId(jobId) {
+  const ids = getSavedJobIds()
+    .filter(id => id !== jobId);
+
+  ids.unshift(jobId);
+  setSavedJobIds(ids);
+}
+
+function removeJobId(jobId) {
+  const ids = getSavedJobIds()
+    .filter(id => id !== jobId);
+
+  setSavedJobIds(ids);
+
+  if (activeJobId === jobId) {
+    activeJobId = null;
+    clearTimeout(pollTimer);
+    hideMainProgress();
+  }
+
+  loadHistory();
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+
+  if (!value) {
+    return '';
+  }
+
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let size = value;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex += 1;
+  }
+
+  return `${size.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function formatDate(value) {
+  if (!value) {
+    return '';
+  }
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return date.toLocaleString();
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
+function showMainProgress() {
+  document.getElementById('progressDiv').style.display = 'block';
+}
+
+function hideMainProgress() {
+  document.getElementById('progressDiv').style.display = 'none';
+  document.getElementById('downloadDiv').style.display = 'none';
+}
+
+function setButtonReady(text = 'Encode Video') {
+  const button = document.getElementById('submitBtn');
+  button.disabled = false;
+  button.textContent = text;
+}
+
+function setButtonBusy() {
+  const button = document.getElementById('submitBtn');
+  button.disabled = true;
+  button.textContent = 'လုပ်ဆောင်နေသည်...';
+}
+
+function renderMainStatus(jobId, data) {
+  activeJobId = jobId;
+  showMainProgress();
+
+  const progress = Math.max(
+    0,
+    Math.min(100, Number(data.progress || 0))
+  );
+
+  document.getElementById('bar').style.width = `${progress}%`;
+
+  const label = statusLabels[data.status] || data.status || 'Unknown';
+  document.getElementById('statusText').textContent =
+    `${label} — ${progress}%`;
+
+  const errorDiv = document.getElementById('errorDiv');
+  const downloadDiv = document.getElementById('downloadDiv');
+
+  if (data.status === 'done') {
+    clearTimeout(pollTimer);
+
+    downloadDiv.style.display = 'block';
+    document.getElementById('downloadLink').href =
+      `/api/download/${encodeURIComponent(jobId)}`;
+
+    errorDiv.textContent = '';
+    setButtonReady('နောက် Video တစ်ခု Encode လုပ်မည်');
+
+  } else if (data.status === 'error') {
+    clearTimeout(pollTimer);
+
+    downloadDiv.style.display = 'none';
+    errorDiv.textContent =
+      `Error: ${data.error || 'Unknown encoding error'}`;
+
+    setButtonReady();
+
+  } else if (data.status === 'missing') {
+    clearTimeout(pollTimer);
+
+    downloadDiv.style.display = 'none';
+    errorDiv.textContent =
+      'ယခင် job file ကို server တွင်မတွေ့တော့ပါ။';
+
+    setButtonReady();
+
+  } else {
+    downloadDiv.style.display = 'none';
+    errorDiv.textContent = '';
+    setButtonBusy();
+  }
+}
 
 async function submitJob() {
-  const url = document.getElementById('videoUrl').value.trim();
-  const file = document.getElementById('subFile').files[0];
-  const err = document.getElementById('errorDiv');
-  err.textContent = '';
+  const videoUrlInput = document.getElementById('videoUrl');
+  const subtitleInput = document.getElementById('subFile');
+  const errorDiv = document.getElementById('errorDiv');
 
-  if (!url) { err.textContent = 'Please enter a video URL'; return; }
-  if (!file) { err.textContent = 'Please select a subtitle file'; return; }
+  const videoUrl = videoUrlInput.value.trim();
+  const subtitleFile = subtitleInput.files[0];
 
-  const btn = document.getElementById('submitBtn');
-  btn.disabled = true;
-  btn.textContent = 'Starting...';
+  errorDiv.textContent = '';
 
-  const fd = new FormData();
-  fd.append('video_url', url);
-  fd.append('subtitle', file);
-
-  try {
-    const r = await fetch('/api/submit', { method: 'POST', body: fd });
-    const d = await r.json();
-    if (d.error) throw new Error(d.error);
-    jobId = d.job_id;
-    document.getElementById('progressDiv').style.display = 'block';
-    document.getElementById('downloadDiv').style.display = 'none';
-    pollStatus();
-  } catch (e) {
-    err.textContent = e.message;
-    btn.disabled = false;
-    btn.textContent = 'Encode Video';
+  if (!videoUrl) {
+    errorDiv.textContent = 'Video URL ထည့်ပါ။';
+    return;
   }
-}
 
-async function pollStatus() {
+  if (!/^https?:\/\//i.test(videoUrl)) {
+    errorDiv.textContent =
+      'Video URL က http:// သို့မဟုတ် https:// နဲ့ စရမယ်။';
+    return;
+  }
+
+  if (!subtitleFile) {
+    errorDiv.textContent = 'Subtitle file ရွေးပါ။';
+    return;
+  }
+
+  setButtonBusy();
+
+  document.getElementById('progressDiv').style.display = 'block';
+  document.getElementById('downloadDiv').style.display = 'none';
+  document.getElementById('bar').style.width = '0%';
+  document.getElementById('statusText').textContent =
+    'Server သို့တင်နေသည်...';
+
+  const formData = new FormData();
+  formData.append('video_url', videoUrl);
+  formData.append('subtitle', subtitleFile);
+
   try {
-    const r = await fetch('/api/status/' + jobId);
-    const d = await r.json();
+    const response = await fetch('/api/submit', {
+      method: 'POST',
+      body: formData
+    });
 
-    const bar = document.getElementById('bar');
-    const txt = document.getElementById('statusText');
-    bar.style.width = (d.progress || 0) + '%';
+    const data = await response.json();
 
-    const labels = {
-      queued: 'Queued...', downloading: 'Downloading video...',
-      parsing: 'Parsing subtitles...', rendering: 'Rendering subtitles...',
-      encoding: 'Encoding video...', done: 'Done!', error: 'Error'
-    };
-    txt.textContent = (labels[d.status] || d.status) + ' ' + (d.progress || 0) + '%';
-
-    if (d.status === 'done') {
-      clearInterval(pollTimer);
-      document.getElementById('downloadDiv').style.display = 'block';
-      document.getElementById('downloadLink').href = '/api/download/' + jobId;
-      const btn = document.getElementById('submitBtn');
-      btn.disabled = false;
-      btn.textContent = 'Encode Another';
-    } else if (d.status === 'error') {
-      clearInterval(pollTimer);
-      document.getElementById('errorDiv').textContent = 'Error: ' + d.error;
-      const btn = document.getElementById('submitBtn');
-      btn.disabled = false;
-      btn.textContent = 'Encode Video';
-    } else {
-      pollTimer = setTimeout(pollStatus, 3000);
+    if (!response.ok || data.error) {
+      throw new Error(data.error || `HTTP ${response.status}`);
     }
-  } catch (e) {
-    pollTimer = setTimeout(pollStatus, 5000);
+
+    activeJobId = data.job_id;
+
+    saveJobId(activeJobId);
+    localStorage.setItem(URL_STORAGE_KEY, videoUrl);
+
+    renderMainStatus(activeJobId, {
+      status: 'queued',
+      progress: 0
+    });
+
+    await loadHistory();
+    schedulePoll(1000);
+
+  } catch (error) {
+    errorDiv.textContent = error.message;
+    setButtonReady();
   }
 }
+
+function schedulePoll(delay = 3000) {
+  clearTimeout(pollTimer);
+
+  pollTimer = setTimeout(() => {
+    pollActiveJob();
+  }, delay);
+}
+
+async function pollActiveJob() {
+  if (!activeJobId) {
+    return;
+  }
+
+  try {
+    const response = await fetch(
+      `/api/status/${encodeURIComponent(activeJobId)}`,
+      { cache: 'no-store' }
+    );
+
+    if (response.status === 404) {
+      renderMainStatus(activeJobId, {
+        status: 'missing',
+        progress: 0
+      });
+      await loadHistory();
+      return;
+    }
+
+    const data = await response.json();
+
+    if (!response.ok || data.error) {
+      throw new Error(data.error || `HTTP ${response.status}`);
+    }
+
+    renderMainStatus(activeJobId, data);
+    await loadHistory();
+
+    if (!['done', 'error'].includes(data.status)) {
+      schedulePoll(3000);
+    }
+
+  } catch (error) {
+    document.getElementById('statusText').textContent =
+      'Connection ပြန်စမ်းနေသည်...';
+
+    schedulePoll(5000);
+  }
+}
+
+function renderHistory(jobs) {
+  const historyList = document.getElementById('historyList');
+
+  if (!jobs.length) {
+    historyList.innerHTML =
+      '<div class="history-empty">မရှိသေးပါ</div>';
+    return;
+  }
+
+  historyList.innerHTML = jobs.map(job => {
+    const status = job.status || 'unknown';
+    const progress = Math.max(
+      0,
+      Math.min(100, Number(job.progress || 0))
+    );
+
+    const label = statusLabels[status] || status;
+    const date = formatDate(job.created || job.updated);
+    const size = formatBytes(job.size);
+
+    let actionHtml = '';
+
+    if (status === 'done') {
+      actionHtml = `
+        <div class="history-actions">
+          <a
+            class="history-download"
+            href="/api/download/${encodeURIComponent(job.job_id)}"
+          >
+            ⬇ Download ${size ? `(${escapeHtml(size)})` : ''}
+          </a>
+
+          <button
+            class="remove-button"
+            type="button"
+            onclick="removeJobId('${escapeHtml(job.job_id)}')"
+          >
+            History မှဖယ်မည်
+          </button>
+        </div>
+      `;
+    } else if (status === 'error' || status === 'missing') {
+      actionHtml = `
+        <div class="history-actions">
+          <button
+            class="remove-button"
+            type="button"
+            onclick="removeJobId('${escapeHtml(job.job_id)}')"
+          >
+            History မှဖယ်မည်
+          </button>
+        </div>
+      `;
+    }
+
+    const errorHtml = job.error
+      ? `<div class="history-error">${escapeHtml(job.error)}</div>`
+      : '';
+
+    return `
+      <div class="history-item">
+        <div class="history-row">
+          <div class="history-id">
+            Job: ${escapeHtml(job.job_id)}
+          </div>
+
+          <div class="history-status">
+            ${escapeHtml(label)} — ${progress}%
+          </div>
+        </div>
+
+        ${date
+          ? `<div class="history-date">${escapeHtml(date)}</div>`
+          : ''
+        }
+
+        <div class="mini-bar-bg">
+          <div
+            class="mini-bar"
+            style="width: ${progress}%"
+          ></div>
+        </div>
+
+        ${errorHtml}
+        ${actionHtml}
+      </div>
+    `;
+  }).join('');
+}
+
+async function loadHistory() {
+  const ids = getSavedJobIds();
+
+  if (!ids.length) {
+    renderHistory([]);
+    return [];
+  }
+
+  try {
+    const response = await fetch(
+      `/api/jobs?ids=${encodeURIComponent(ids.join(','))}`,
+      { cache: 'no-store' }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+    renderHistory(jobs);
+    return jobs;
+
+  } catch (error) {
+    document.getElementById('historyList').innerHTML =
+      '<div class="history-empty">History ကို ယာယီဖတ်မရပါ။</div>';
+
+    return [];
+  }
+}
+
+async function restorePreviousState() {
+  const savedUrl = localStorage.getItem(URL_STORAGE_KEY);
+
+  if (savedUrl) {
+    document.getElementById('videoUrl').value = savedUrl;
+  }
+
+  const jobs = await loadHistory();
+
+  if (!jobs.length) {
+    return;
+  }
+
+  const latestJob = jobs[0];
+
+  if (latestJob.status === 'missing') {
+    return;
+  }
+
+  activeJobId = latestJob.job_id;
+  renderMainStatus(activeJobId, latestJob);
+
+  if (!['done', 'error'].includes(latestJob.status)) {
+    schedulePoll(2000);
+  }
+}
+
+document
+  .getElementById('submitBtn')
+  .addEventListener('click', submitJob);
+
+window.addEventListener('load', async () => {
+  await restorePreviousState();
+
+  clearInterval(historyTimer);
+  historyTimer = setInterval(loadHistory, 10000);
+});
 </script>
+
 </body>
 </html>
