@@ -1,94 +1,176 @@
 #!/usr/bin/env python3
-"""
-Video Subtitle Burner for Railway.
-
-Features:
-- Downloads a remote video
-- Accepts VTT/SRT subtitle uploads
-- Converts subtitles to ASS
-- Burns subtitles in one continuous FFmpeg encode
-- Preserves browser job history through localStorage
-- Supports Railway persistent volumes
-"""
 
 import html
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import threading
 import uuid
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
+import boto3
 import requests
-from flask import Flask, jsonify, render_template, request, send_file
+from boto3.s3.transfer import TransferConfig
+from botocore.config import Config
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+)
 
 
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
-
-# Railway volume ရှိရင် အဲဒီနေရာကိုသုံးမယ်။
-# Volume မရှိရင် project ထဲက jobs folder ကိုသုံးမယ်။
-_storage_path = (
-    os.environ.get("JOBS_DIR")
-    or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
-)
-
-if _storage_path:
-    JOBS_DIR = Path(_storage_path).resolve()
-else:
-    JOBS_DIR = (BASE_DIR / "jobs").resolve()
-
+JOBS_DIR = Path(
+    os.environ.get("JOBS_DIR", "/tmp/video-subtitle-jobs")
+).resolve()
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 FONT_NAME = os.environ.get("SUBTITLE_FONT_NAME", "Padauk")
-FONTS_DIR = os.environ.get(
-    "FONTS_DIR",
-    "/usr/share/fonts/truetype/noto"
+FONTS_DIR = os.environ.get("FONTS_DIR", "/usr/share/fonts")
+
+JOB_TTL_HOURS = max(
+    1,
+    int(os.environ.get("JOB_TTL_HOURS", "24"))
 )
 
-JOB_TTL_HOURS = int(os.environ.get("JOB_TTL_HOURS", "24"))
+DOWNLOAD_URL_EXPIRES = min(
+    604800,
+    max(60, int(os.environ.get("DOWNLOAD_URL_EXPIRES", "21600")))
+)
+
+MAX_SOURCE_BYTES = int(
+    float(os.environ.get("MAX_SOURCE_GB", "10"))
+    * 1024 * 1024 * 1024
+)
+
+MAX_CONCURRENT_JOBS = max(
+    1,
+    int(os.environ.get("MAX_CONCURRENT_JOBS", "1"))
+)
+
 MAX_HISTORY_IDS = 20
 VALID_JOB_ID = re.compile(r"^[a-f0-9]{12}$")
+REDIRECT_CODES = {301, 302, 303, 307, 308}
+
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "").strip()
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "").strip()
+R2_SECRET_ACCESS_KEY = os.environ.get(
+    "R2_SECRET_ACCESS_KEY",
+    ""
+).strip()
+R2_BUCKET = os.environ.get("R2_BUCKET", "").strip()
+
+JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
+R2_CLIENT = None
+R2_CLIENT_LOCK = threading.Lock()
+
+TRANSFER_CONFIG = TransferConfig(
+    multipart_threshold=16 * 1024 * 1024,
+    multipart_chunksize=16 * 1024 * 1024,
+    max_concurrency=2,
+    max_io_queue=2,
+    io_chunksize=1024 * 1024,
+    use_threads=True,
+)
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
 
 
 def now_iso():
-    return datetime.now().isoformat(timespec="seconds")
+    return now_utc().isoformat(timespec="seconds")
 
 
 def valid_job_id(job_id):
     return bool(VALID_JOB_ID.fullmatch(job_id or ""))
 
 
+def r2_is_configured():
+    return all([
+        R2_ACCOUNT_ID,
+        R2_ACCESS_KEY_ID,
+        R2_SECRET_ACCESS_KEY,
+        R2_BUCKET,
+    ])
+
+
+def get_r2_client():
+    global R2_CLIENT
+
+    if R2_CLIENT is not None:
+        return R2_CLIENT
+
+    if not r2_is_configured():
+        raise RuntimeError(
+            "R2 is not configured. Add R2_ACCOUNT_ID, "
+            "R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET "
+            "to Railway Variables."
+        )
+
+    with R2_CLIENT_LOCK:
+        if R2_CLIENT is None:
+            R2_CLIENT = boto3.client(
+                service_name="s3",
+                endpoint_url=(
+                    f"https://{R2_ACCOUNT_ID}"
+                    ".r2.cloudflarestorage.com"
+                ),
+                aws_access_key_id=R2_ACCESS_KEY_ID,
+                aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+                region_name="auto",
+                config=Config(
+                    retries={
+                        "max_attempts": 8,
+                        "mode": "adaptive",
+                    },
+                    connect_timeout=20,
+                    read_timeout=180,
+                    tcp_keepalive=True,
+                ),
+            )
+
+    return R2_CLIENT
+
+
 def read_status_file(status_file):
     try:
-        return json.loads(status_file.read_text(encoding="utf-8"))
+        return json.loads(
+            status_file.read_text(encoding="utf-8")
+        )
     except (OSError, json.JSONDecodeError):
         return None
 
 
 def write_json_atomic(path, data):
-    """
-    status API ကဖတ်နေချိန် status.json တစ်ဝက်တစ်ပျက်ဖြစ်မသွားအောင်
-    temporary file ရေးပြီး atomic replace လုပ်သည်။
-    """
-    temp_path = path.with_suffix(".tmp")
-    temp_path.write_text(
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    temporary_path = path.with_suffix(".tmp")
+    temporary_path.write_text(
         json.dumps(data, ensure_ascii=False),
-        encoding="utf-8"
+        encoding="utf-8",
     )
-    os.replace(temp_path, path)
+    os.replace(temporary_path, path)
 
 
 def update_status(job_id, **changes):
     job_dir = JOBS_DIR / job_id
-    status_file = job_dir / "status.json"
+    job_dir.mkdir(parents=True, exist_ok=True)
 
+    status_file = job_dir / "status.json"
     current = read_status_file(status_file) or {}
+
     current.update(changes)
     current["updated"] = now_iso()
 
@@ -97,13 +179,6 @@ def update_status(job_id, **changes):
 
 
 def parse_timestamp(value):
-    """
-    Supports:
-    00:01:23.456
-    00:01:23,456
-    01:23.456
-    01:23,456
-    """
     value = value.strip().replace(",", ".")
     parts = value.split(":")
 
@@ -119,8 +194,10 @@ def parse_timestamp(value):
         else:
             return None
 
-        total = hours * 3600 + minutes * 60 + seconds
-        return max(0.0, total)
+        return max(
+            0.0,
+            hours * 3600 + minutes * 60 + seconds
+        )
     except ValueError:
         return None
 
@@ -132,29 +209,24 @@ def clean_subtitle_line(text):
 
 
 def parse_subtitles(path):
-    """
-    Parse VTT or SRT subtitles.
-
-    Returns:
-        [
-            (start_seconds, end_seconds, ["line 1", "line 2"]),
-            ...
-        ]
-    """
     content = Path(path).read_text(
         encoding="utf-8-sig",
-        errors="replace"
+        errors="replace",
     )
 
     content = content.replace("\r\n", "\n").replace("\r", "\n")
-
     blocks = re.split(r"\n[ \t]*\n", content.strip())
+
     cues = []
 
     for block in blocks:
-        lines = [line.strip("\ufeff") for line in block.splitlines()]
+        lines = [
+            line.strip("\ufeff")
+            for line in block.splitlines()
+        ]
 
         timing_index = None
+
         for index, line in enumerate(lines):
             if "-->" in line:
                 timing_index = index
@@ -166,7 +238,12 @@ def parse_subtitles(path):
         timing_line = lines[timing_index]
         left, right = timing_line.split("-->", 1)
 
-        start_token = left.strip().split()[0] if left.strip() else ""
+        start_token = (
+            left.strip().split()[0]
+            if left.strip()
+            else ""
+        )
+
         right_parts = right.strip().split()
         end_token = right_parts[0] if right_parts else ""
 
@@ -177,8 +254,10 @@ def parse_subtitles(path):
             continue
 
         text_lines = []
+
         for line in lines[timing_index + 1:]:
             cleaned = clean_subtitle_line(line)
+
             if cleaned:
                 text_lines.append(cleaned)
 
@@ -190,24 +269,24 @@ def parse_subtitles(path):
 
 
 def ass_time(seconds):
-    """
-    Convert seconds to ASS timestamp:
-    H:MM:SS.cc
-    """
-    seconds = max(0.0, float(seconds))
-    total_centiseconds = int(round(seconds * 100))
+    total_centiseconds = int(
+        round(max(0.0, float(seconds)) * 100)
+    )
 
-    hours, remainder = divmod(total_centiseconds, 360000)
+    hours, remainder = divmod(
+        total_centiseconds,
+        360000,
+    )
     minutes, remainder = divmod(remainder, 6000)
     secs, centiseconds = divmod(remainder, 100)
 
-    return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
+    return (
+        f"{hours}:{minutes:02d}:"
+        f"{secs:02d}.{centiseconds:02d}"
+    )
 
 
 def escape_ass_text(text):
-    """
-    Prevent subtitle text from injecting ASS formatting commands.
-    """
     text = text.replace("\\", r"\\")
     text = text.replace("{", r"\{")
     text = text.replace("}", r"\}")
@@ -215,16 +294,6 @@ def escape_ass_text(text):
 
 
 def create_ass_subtitle(cues, output_path):
-    """
-    Create a resolution-independent ASS subtitle file.
-
-    PlayResY=1080 နဲ့ Fontsize=72 ဖြစ်တဲ့အတွက်:
-    - 1080p မှာ 72
-    - 720p မှာ 48 ဝန်းကျင် (ပုံမှန် စာတန်းဆိုဒ်)
-    - 480p မှာ 32 ဝန်းကျင်
-
-    ဒါကြောင့် မူရင်း fixed 36-pixel PNG ထက် ပုံမှန်အရွယ်ဖြစ်မယ်။
-    """
     header = f"""[Script Info]
 Title: Video Subtitle Burner
 ScriptType: v4.00+
@@ -254,89 +323,217 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if not cleaned_lines:
             continue
 
-        text = r"\N".join(cleaned_lines)
+        subtitle_text = r"\N".join(cleaned_lines)
 
         events.append(
             "Dialogue: 0,"
             f"{ass_time(start)},"
             f"{ass_time(end)},"
             "Default,,0,0,0,,"
-            f"{text}"
+            f"{subtitle_text}"
         )
 
     output_path.write_text(
         header + "\n".join(events) + "\n",
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
-def download_video(url, destination):
-    """
-    Download remote video with connect/read timeout.
-    """
+def validate_public_host(url):
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(
+            "Video URL must use http:// or https://"
+        )
+
+    if not parsed.hostname:
+        raise ValueError("Video URL hostname is missing")
+
+    if parsed.username or parsed.password:
+        raise ValueError(
+            "Username/password in Video URL is not allowed"
+        )
+
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid Video URL port") from exc
+
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+
+    try:
+        addresses = socket.getaddrinfo(
+            parsed.hostname,
+            port,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise ValueError(
+            "Video URL hostname cannot be resolved"
+        ) from exc
+
+    if not addresses:
+        raise ValueError(
+            "Video URL hostname cannot be resolved"
+        )
+
+    for address in addresses:
+        ip_text = address[4][0]
+        ip = ipaddress.ip_address(ip_text)
+
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise ValueError(
+                "Private/internal network URLs are not allowed"
+            )
+
+
+def validate_remote_video_url(url):
+    current_url = url
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Linux; Android 13) "
             "AppleWebKit/537.36 Chrome/120 Safari/537.36"
-        )
+        ),
+        "Range": "bytes=0-0",
+        "Accept": "*/*",
     }
 
-    with requests.get(
-        url,
-        stream=True,
-        timeout=(20, 180),
-        allow_redirects=True,
-        headers=headers
-    ) as response:
-        response.raise_for_status()
+    session = requests.Session()
 
-        with open(destination, "wb") as output:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if chunk:
-                    output.write(chunk)
+    try:
+        for _ in range(6):
+            validate_public_host(current_url)
 
-    if not destination.exists() or destination.stat().st_size < 1024:
-        raise RuntimeError("Downloaded video file is empty or invalid")
+            response = session.get(
+                current_url,
+                headers=headers,
+                stream=True,
+                allow_redirects=False,
+                timeout=(20, 60),
+            )
 
-    return destination
+            try:
+                if response.status_code in REDIRECT_CODES:
+                    location = response.headers.get("Location")
+
+                    if not location:
+                        raise ValueError(
+                            "Video URL redirect has no Location"
+                        )
+
+                    current_url = urljoin(
+                        current_url,
+                        location,
+                    )
+                    continue
+
+                response.raise_for_status()
+
+                total_size = None
+                content_range = response.headers.get(
+                    "Content-Range",
+                    "",
+                )
+
+                range_match = re.search(
+                    r"/(\d+)$",
+                    content_range,
+                )
+
+                if range_match:
+                    total_size = int(range_match.group(1))
+                elif response.status_code == 200:
+                    content_length = response.headers.get(
+                        "Content-Length"
+                    )
+
+                    if content_length and content_length.isdigit():
+                        total_size = int(content_length)
+
+                if (
+                    total_size is not None
+                    and total_size > MAX_SOURCE_BYTES
+                ):
+                    max_gb = MAX_SOURCE_BYTES / 1024 ** 3
+
+                    raise ValueError(
+                        f"Video is too large. Maximum is "
+                        f"{max_gb:g} GB."
+                    )
+
+                return current_url, total_size
+
+            finally:
+                response.close()
+
+        raise ValueError("Too many Video URL redirects")
+
+    finally:
+        session.close()
 
 
-def probe_duration(video_path):
+def probe_duration(video_url):
     command = [
         "ffprobe",
         "-v", "error",
+        "-rw_timeout", "180000000",
+        "-user_agent",
+        (
+            "Mozilla/5.0 (Linux; Android 13) "
+            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        ),
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
-        str(video_path)
+        video_url,
     ]
 
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True
-    )
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=240,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "Timed out while reading video information"
+        ) from exc
 
     if result.returncode != 0:
         raise RuntimeError(
             "Cannot read video duration: "
-            + (result.stderr.strip() or "ffprobe failed")
+            + (
+                result.stderr.strip()[-1000:]
+                or "ffprobe failed"
+            )
         )
 
     try:
         duration = float(result.stdout.strip())
     except ValueError as exc:
-        raise RuntimeError("Invalid video duration") from exc
+        raise RuntimeError(
+            "Invalid video duration"
+        ) from exc
 
     if duration <= 0:
-        raise RuntimeError("Video duration is zero or invalid")
+        raise RuntimeError(
+            "Video duration is zero or invalid"
+        )
 
     return duration
 
 
 def escape_ffmpeg_filter_path(value):
-    """
-    Escape path characters for FFmpeg filter syntax.
-    """
     value = str(value)
     value = value.replace("\\", r"\\")
     value = value.replace(":", r"\:")
@@ -348,230 +545,421 @@ def escape_ffmpeg_filter_path(value):
 
 
 def timestamp_to_seconds(value):
-    """
-    Parse FFmpeg progress value such as 00:01:23.456789.
-    """
     try:
         hours, minutes, seconds = value.strip().split(":")
-        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+        return (
+            int(hours) * 3600
+            + int(minutes) * 60
+            + float(seconds)
+        )
     except (ValueError, AttributeError):
         return 0.0
 
 
-def run_ffmpeg_with_progress(command, job_id, duration):
-    """
-    Run one continuous FFmpeg encode and update status.json.
-    """
+def delete_r2_object(object_key):
+    if not object_key or not r2_is_configured():
+        return
+
+    get_r2_client().delete_object(
+        Bucket=R2_BUCKET,
+        Key=object_key,
+    )
+
+
+def stream_ffmpeg_to_r2(
+    command,
+    job_id,
+    duration,
+    object_key,
+):
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1
+        stderr=subprocess.PIPE,
+        bufsize=0,
     )
 
-    recent_output = deque(maxlen=40)
+    if process.stdout is None or process.stderr is None:
+        process.kill()
+        raise RuntimeError(
+            "Unable to open FFmpeg output streams"
+        )
 
-    if process.stdout is None:
-        raise RuntimeError("Unable to read FFmpeg output")
+    recent_output = deque(maxlen=80)
 
-    for raw_line in process.stdout:
-        line = raw_line.strip()
+    def read_ffmpeg_status():
+        for raw_line in iter(process.stderr.readline, b""):
+            line = raw_line.decode(
+                "utf-8",
+                errors="replace",
+            ).strip()
 
-        if not line:
-            continue
+            if not line:
+                continue
 
-        recent_output.append(line)
-
-        if line.startswith("out_time="):
-            encoded_seconds = timestamp_to_seconds(
-                line.split("=", 1)[1]
-            )
-
-            if duration > 0:
-                percent = 20 + int(
-                    min(encoded_seconds / duration, 1.0) * 75
+            if line.startswith("out_time="):
+                encoded_seconds = timestamp_to_seconds(
+                    line.split("=", 1)[1]
                 )
+
+                if duration > 0:
+                    progress = 15 + int(
+                        min(
+                            encoded_seconds / duration,
+                            1.0,
+                        ) * 80
+                    )
+
+                    update_status(
+                        job_id,
+                        status="encoding",
+                        progress=min(progress, 95),
+                    )
+
+            elif line == "progress=end":
                 update_status(
                     job_id,
-                    status="encoding",
-                    progress=min(percent, 95)
+                    status="uploading",
+                    progress=97,
                 )
 
-        elif line == "progress=end":
-            update_status(
-                job_id,
-                status="finalizing",
-                progress=97
+            elif not re.match(
+                r"^[a-zA-Z0-9_]+=",
+                line,
+            ):
+                recent_output.append(line)
+
+    stderr_thread = threading.Thread(
+        target=read_ffmpeg_status,
+        daemon=True,
+        name=f"ffmpeg-status-{job_id}",
+    )
+    stderr_thread.start()
+
+    client = get_r2_client()
+
+    try:
+        client.upload_fileobj(
+            process.stdout,
+            R2_BUCKET,
+            object_key,
+            ExtraArgs={
+                "ContentType": "video/mp4",
+                "ContentDisposition": (
+                    f'attachment; filename="'
+                    f'subtitled-{job_id}.mp4"'
+                ),
+            },
+            Config=TRANSFER_CONFIG,
+        )
+
+        process.stdout.close()
+        return_code = process.wait()
+        stderr_thread.join(timeout=10)
+
+        if return_code != 0:
+            delete_r2_object(object_key)
+
+            details = "\n".join(recent_output)
+
+            raise RuntimeError(
+                f"FFmpeg failed with code {return_code}: "
+                f"{details[-1800:]}"
             )
 
-    return_code = process.wait()
-
-    if return_code != 0:
-        details = "\n".join(recent_output)
-        raise RuntimeError(
-            f"FFmpeg failed with code {return_code}: {details[-1500:]}"
+        metadata = client.head_object(
+            Bucket=R2_BUCKET,
+            Key=object_key,
         )
+
+        size = int(metadata.get("ContentLength", 0))
+
+        if size < 1000:
+            delete_r2_object(object_key)
+
+            raise RuntimeError(
+                "Output video was not created correctly"
+            )
+
+        return size
+
+    except Exception:
+        if process.poll() is None:
+            process.kill()
+
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+        try:
+            delete_r2_object(object_key)
+        except Exception:
+            pass
+
+        raise
+
+    finally:
+        try:
+            process.stdout.close()
+        except Exception:
+            pass
+
+        try:
+            process.stderr.close()
+        except Exception:
+            pass
 
 
 def encode_job(job_id, video_url, subtitle_path):
     job_dir = JOBS_DIR / job_id
-    video_path = job_dir / "input.mp4"
     ass_path = job_dir / "subtitles.ass"
-    output_path = job_dir / "output.mp4"
+    object_key = f"outputs/{job_id}.mp4"
 
     try:
         update_status(
             job_id,
-            status="downloading",
-            progress=5
+            status="waiting",
+            progress=1,
         )
 
-        download_video(video_url, video_path)
-
-        update_status(
-            job_id,
-            status="probing",
-            progress=10
-        )
-
-        duration = probe_duration(video_path)
-
-        update_status(
-            job_id,
-            status="preparing",
-            progress=15,
-            duration=duration
-        )
-
-        cues = parse_subtitles(subtitle_path)
-
-        if not cues:
-            raise ValueError(
-                "No valid subtitles were found in the uploaded file"
+        with JOB_SEMAPHORE:
+            update_status(
+                job_id,
+                status="checking",
+                progress=3,
             )
 
-        create_ass_subtitle(cues, ass_path)
+            safe_video_url, source_size = (
+                validate_remote_video_url(video_url)
+            )
 
-        update_status(
-            job_id,
-            status="encoding",
-            progress=20,
-            total_cues=len(cues)
-        )
+            update_status(
+                job_id,
+                status="probing",
+                progress=7,
+                source_size=source_size,
+            )
 
-        ass_filter_path = escape_ffmpeg_filter_path(ass_path)
-        fonts_filter_path = escape_ffmpeg_filter_path(FONTS_DIR)
+            duration = probe_duration(safe_video_url)
 
-        subtitle_filter = (
-            f"subtitles=filename='{ass_filter_path}':"
-            f"fontsdir='{fonts_filter_path}'"
-        )
+            update_status(
+                job_id,
+                status="preparing",
+                progress=10,
+                duration=duration,
+            )
 
-        command = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel", "error",
+            cues = parse_subtitles(subtitle_path)
 
-            "-i", str(video_path),
+            if not cues:
+                raise ValueError(
+                    "No valid subtitles were found "
+                    "in the uploaded file"
+                )
 
-            "-map", "0:v:0",
-            "-map", "0:a:0?",
+            create_ass_subtitle(cues, ass_path)
 
-            "-vf", subtitle_filter,
+            ass_filter_path = escape_ffmpeg_filter_path(
+                ass_path
+            )
+            fonts_filter_path = escape_ffmpeg_filter_path(
+                FONTS_DIR
+            )
 
-            # Video ကို တစ်ခါတည်း encode လုပ်တာကြောင့်
-            # segment boundary timestamp ပြဿနာမရှိတော့ပါ။
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "21",
-            "-pix_fmt", "yuv420p",
-            "-threads", "2",
+            subtitle_filter = (
+                f"subtitles=filename='{ass_filter_path}':"
+                f"fontsdir='{fonts_filter_path}'"
+            )
 
-            # Browser/device compatibility အတွက် AAC သုံးသည်။
-            "-c:a", "aac",
-            "-b:a", "128k",
+            update_status(
+                job_id,
+                status="encoding",
+                progress=15,
+                total_cues=len(cues),
+            )
 
-            # Input variable frame rate/timestamps ကို မလိုအပ်ဘဲ
-            # fixed FPS အဖြစ် force မလုပ်ရန်။
-            "-fps_mode", "passthrough",
+            command = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
 
-            "-map_metadata", "0",
-            "-map_chapters", "0",
-            "-avoid_negative_ts", "make_zero",
-            "-max_muxing_queue_size", "2048",
-            "-movflags", "+faststart",
+                "-rw_timeout", "180000000",
+                "-reconnect", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5",
+                "-user_agent",
+                (
+                    "Mozilla/5.0 (Linux; Android 13) "
+                    "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+                ),
 
-            "-progress", "pipe:1",
-            "-nostats",
+                "-i", safe_video_url,
 
-            str(output_path)
-        ]
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
 
-        run_ffmpeg_with_progress(
-            command,
-            job_id,
-            duration
-        )
+                "-vf", subtitle_filter,
 
-        if (
-            not output_path.exists()
-            or output_path.stat().st_size < 1000
-        ):
-            raise RuntimeError("Output video was not created correctly")
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "21",
+                "-pix_fmt", "yuv420p",
+                "-threads", "2",
 
-        # Output နဲ့ status ပဲထားပြီး input/intermediate files ဖျက်မယ်။
-        video_path.unlink(missing_ok=True)
-        ass_path.unlink(missing_ok=True)
-        Path(subtitle_path).unlink(missing_ok=True)
+                "-c:a", "aac",
+                "-b:a", "128k",
 
-        update_status(
-            job_id,
-            status="done",
-            progress=100,
-            output=output_path.name,
-            size=output_path.stat().st_size
-        )
+                "-fps_mode", "passthrough",
+                "-map_metadata", "-1",
+                "-map_chapters", "-1",
+                "-avoid_negative_ts", "make_zero",
+                "-max_muxing_queue_size", "2048",
+
+                "-movflags",
+                (
+                    "+frag_keyframe"
+                    "+empty_moov"
+                    "+default_base_moof"
+                ),
+                "-frag_duration", "2000000",
+
+                "-progress", "pipe:2",
+                "-nostats",
+
+                "-f", "mp4",
+                "pipe:1",
+            ]
+
+            output_size = stream_ffmpeg_to_r2(
+                command,
+                job_id,
+                duration,
+                object_key,
+            )
+
+            update_status(
+                job_id,
+                status="done",
+                progress=100,
+                output_key=object_key,
+                size=output_size,
+            )
 
     except Exception as exc:
+        try:
+            delete_r2_object(object_key)
+        except Exception:
+            pass
+
         update_status(
             job_id,
             status="error",
             progress=0,
-            error=str(exc)[:1500]
+            error=str(exc)[:1800],
         )
+
+    finally:
+        Path(subtitle_path).unlink(missing_ok=True)
+        ass_path.unlink(missing_ok=True)
+
+
+def parse_created_time(value):
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(value)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
 
 
 def cleanup_old_jobs():
-    now = datetime.now()
+    cutoff = now_utc() - timedelta(hours=JOB_TTL_HOURS)
     removed = 0
 
-    if not JOBS_DIR.exists():
-        return removed
+    if JOBS_DIR.exists():
+        for job_dir in JOBS_DIR.iterdir():
+            if not job_dir.is_dir():
+                continue
 
-    for job_dir in JOBS_DIR.iterdir():
-        if not job_dir.is_dir():
-            continue
+            status_data = read_status_file(
+                job_dir / "status.json"
+            ) or {}
 
-        status_file = job_dir / "status.json"
-        status_data = read_status_file(status_file)
+            created = parse_created_time(
+                status_data.get("created")
+            )
 
-        try:
-            if status_data and status_data.get("created"):
-                created = datetime.fromisoformat(
-                    status_data["created"]
+            if created is None:
+                try:
+                    created = datetime.fromtimestamp(
+                        job_dir.stat().st_mtime,
+                        tz=timezone.utc,
+                    )
+                except OSError:
+                    continue
+
+            if created >= cutoff:
+                continue
+
+            object_key = status_data.get("output_key")
+
+            if object_key:
+                try:
+                    delete_r2_object(object_key)
+                except Exception:
+                    continue
+
+            shutil.rmtree(
+                job_dir,
+                ignore_errors=True,
+            )
+            removed += 1
+
+    if r2_is_configured():
+        client = get_r2_client()
+        continuation_token = None
+
+        while True:
+            arguments = {
+                "Bucket": R2_BUCKET,
+                "Prefix": "outputs/",
+                "MaxKeys": 1000,
+            }
+
+            if continuation_token:
+                arguments["ContinuationToken"] = (
+                    continuation_token
                 )
-            else:
-                created = datetime.fromtimestamp(
-                    job_dir.stat().st_mtime
-                )
 
-            if now - created > timedelta(hours=JOB_TTL_HOURS):
-                shutil.rmtree(job_dir, ignore_errors=True)
-                removed += 1
-        except (ValueError, OSError):
-            continue
+            response = client.list_objects_v2(**arguments)
+
+            for item in response.get("Contents", []):
+                modified = item.get("LastModified")
+
+                if modified and modified < cutoff:
+                    client.delete_object(
+                        Bucket=R2_BUCKET,
+                        Key=item["Key"],
+                    )
+                    removed += 1
+
+            if not response.get("IsTruncated"):
+                break
+
+            continuation_token = response.get(
+                "NextContinuationToken"
+            )
+
+            if not continuation_token:
+                break
 
     return removed
 
@@ -583,32 +971,64 @@ def index():
 
 @app.route("/api/submit", methods=["POST"])
 def submit():
-    video_url = request.form.get("video_url", "").strip()
+    if not r2_is_configured():
+        return jsonify({
+            "error": (
+                "R2 storage is not configured. "
+                "Add the R2 variables in Railway."
+            )
+        }), 503
+
+    video_url = request.form.get(
+        "video_url",
+        "",
+    ).strip()
 
     if not video_url:
-        return jsonify({"error": "Video URL required"}), 400
-
-    if not re.match(r"^https?://", video_url, re.IGNORECASE):
         return jsonify({
-            "error": "Video URL must start with http:// or https://"
+            "error": "Video URL required"
+        }), 400
+
+    if not re.match(
+        r"^https?://",
+        video_url,
+        re.IGNORECASE,
+    ):
+        return jsonify({
+            "error": (
+                "Video URL must start with "
+                "http:// or https://"
+            )
         }), 400
 
     if "subtitle" not in request.files:
-        return jsonify({"error": "Subtitle file required"}), 400
+        return jsonify({
+            "error": "Subtitle file required"
+        }), 400
 
     subtitle_file = request.files["subtitle"]
 
     if not subtitle_file.filename:
-        return jsonify({"error": "No subtitle file selected"}), 400
+        return jsonify({
+            "error": "No subtitle file selected"
+        }), 400
 
-    extension = Path(subtitle_file.filename).suffix.lower()
+    extension = Path(
+        subtitle_file.filename
+    ).suffix.lower()
 
     if extension not in {".vtt", ".srt"}:
         return jsonify({
-            "error": "Only VTT or SRT subtitle files are supported"
+            "error": (
+                "Only VTT or SRT subtitle "
+                "files are supported"
+            )
         }), 400
 
-    cleanup_old_jobs()
+    try:
+        cleanup_old_jobs()
+    except Exception:
+        pass
 
     job_id = uuid.uuid4().hex[:12]
     job_dir = JOBS_DIR / job_id
@@ -617,9 +1037,6 @@ def submit():
     subtitle_path = job_dir / f"subtitle{extension}"
     subtitle_file.save(str(subtitle_path))
 
-    # Thread မစခင် status file အရင်ရေးရမယ်။
-    # မူရင်း code မှာ thread စပြီးမှ queued ရေးထားတာကြောင့်
-    # downloading status ကို queued ကပြန်ဖုံးနိုင်တဲ့ race ရှိတယ်။
     write_json_atomic(
         job_dir / "status.json",
         {
@@ -627,15 +1044,19 @@ def submit():
             "status": "queued",
             "progress": 0,
             "created": now_iso(),
-            "updated": now_iso()
-        }
+            "updated": now_iso(),
+        },
     )
 
     worker = threading.Thread(
         target=encode_job,
-        args=(job_id, video_url, str(subtitle_path)),
+        args=(
+            job_id,
+            video_url,
+            str(subtitle_path),
+        ),
         daemon=True,
-        name=f"encode-{job_id}"
+        name=f"encode-{job_id}",
     )
     worker.start()
 
@@ -645,13 +1066,18 @@ def submit():
 @app.route("/api/status/<job_id>")
 def status(job_id):
     if not valid_job_id(job_id):
-        return jsonify({"error": "Invalid job ID"}), 400
+        return jsonify({
+            "error": "Invalid job ID"
+        }), 400
 
-    status_file = JOBS_DIR / job_id / "status.json"
-    status_data = read_status_file(status_file)
+    status_data = read_status_file(
+        JOBS_DIR / job_id / "status.json"
+    )
 
     if status_data is None:
-        return jsonify({"error": "Job not found"}), 404
+        return jsonify({
+            "error": "Job not found"
+        }), 404
 
     return jsonify(status_data)
 
@@ -669,8 +1095,9 @@ def jobs():
         if not valid_job_id(job_id):
             continue
 
-        status_file = JOBS_DIR / job_id / "status.json"
-        status_data = read_status_file(status_file)
+        status_data = read_status_file(
+            JOBS_DIR / job_id / "status.json"
+        )
 
         if status_data:
             status_data["job_id"] = job_id
@@ -679,7 +1106,7 @@ def jobs():
             result.append({
                 "job_id": job_id,
                 "status": "missing",
-                "progress": 0
+                "progress": 0,
             })
 
     return jsonify({"jobs": result})
@@ -688,32 +1115,132 @@ def jobs():
 @app.route("/api/download/<job_id>")
 def download(job_id):
     if not valid_job_id(job_id):
-        return jsonify({"error": "Invalid job ID"}), 400
+        return jsonify({
+            "error": "Invalid job ID"
+        }), 400
 
-    output_path = JOBS_DIR / job_id / "output.mp4"
-
-    if not output_path.exists():
-        return jsonify({"error": "File not ready"}), 404
-
-    return send_file(
-        str(output_path),
-        as_attachment=True,
-        download_name=f"subtitled-{job_id}.mp4",
-        mimetype="video/mp4",
-        conditional=True
+    status_data = read_status_file(
+        JOBS_DIR / job_id / "status.json"
     )
+
+    if not status_data:
+        return jsonify({
+            "error": "Job not found"
+        }), 404
+
+    if status_data.get("status") != "done":
+        return jsonify({
+            "error": "File is not ready"
+        }), 409
+
+    object_key = status_data.get("output_key")
+
+    if not object_key:
+        return jsonify({
+            "error": "Output object is missing"
+        }), 404
+
+    try:
+        download_url = get_r2_client().generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": R2_BUCKET,
+                "Key": object_key,
+                "ResponseContentDisposition": (
+                    f'attachment; filename="'
+                    f'subtitled-{job_id}.mp4"'
+                ),
+                "ResponseContentType": "video/mp4",
+            },
+            ExpiresIn=DOWNLOAD_URL_EXPIRES,
+        )
+    except Exception as exc:
+        return jsonify({
+            "error": (
+                "Unable to create download link: "
+                + str(exc)[:500]
+            )
+        }), 500
+
+    return redirect(download_url, code=302)
+
+
+@app.route("/api/jobs/<job_id>", methods=["DELETE"])
+def delete_job(job_id):
+    if not valid_job_id(job_id):
+        return jsonify({
+            "error": "Invalid job ID"
+        }), 400
+
+    job_dir = JOBS_DIR / job_id
+    status_data = read_status_file(
+        job_dir / "status.json"
+    )
+
+    if not status_data:
+        return jsonify({
+            "deleted": True,
+            "job_id": job_id,
+        })
+
+    current_status = status_data.get("status")
+
+    if current_status not in {
+        "done",
+        "error",
+        "missing",
+    }:
+        return jsonify({
+            "error": (
+                "Encoding is still running. "
+                "Wait until it finishes before deleting."
+            )
+        }), 409
+
+    object_key = status_data.get("output_key")
+
+    try:
+        if object_key:
+            delete_r2_object(object_key)
+
+        shutil.rmtree(
+            job_dir,
+            ignore_errors=True,
+        )
+
+        return jsonify({
+            "deleted": True,
+            "job_id": job_id,
+        })
+
+    except Exception as exc:
+        return jsonify({
+            "error": (
+                "Delete failed: "
+                + str(exc)[:500]
+            )
+        }), 500
 
 
 @app.route("/api/cleanup", methods=["POST"])
 def cleanup():
-    removed = cleanup_old_jobs()
-    return jsonify({"removed": removed})
+    try:
+        removed = cleanup_old_jobs()
+
+        return jsonify({
+            "removed": removed
+        })
+    except Exception as exc:
+        return jsonify({
+            "error": str(exc)[:1000]
+        }), 500
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
+
     app.run(
         host="0.0.0.0",
         port=port,
-        threaded=True
+        threaded=True,
     )
