@@ -1,408 +1,719 @@
 #!/usr/bin/env python3
 """
-Video Subtitle Burner - Web app for Railway
-Burns Burmese/English subtitles into videos using ffmpeg.
+Video Subtitle Burner for Railway.
 
 Features:
-- Download video from remote URL
-- Upload VTT/SRT subtitle file
-- Background encoding (survives browser close)
-- Download link when done, auto-cleanup
+- Downloads a remote video
+- Accepts VTT/SRT subtitle uploads
+- Converts subtitles to ASS
+- Burns subtitles in one continuous FFmpeg encode
+- Preserves browser job history through localStorage
+- Supports Railway persistent volumes
 """
+
+import html
+import json
 import os
 import re
-import uuid
-import json
-import time
-import threading
-import subprocess
 import shutil
+import subprocess
+import threading
+import uuid
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
-from flask import Flask, request, jsonify, render_template, send_file
+from flask import Flask, jsonify, render_template, request, send_file
+
 
 app = Flask(__name__)
 
-# Config
-BASE_DIR = Path(__file__).parent
-JOBS_DIR = BASE_DIR / "jobs"
-JOBS_DIR.mkdir(exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
 
-# Fonts (bundled or system)
-FONT_MM = os.environ.get("FONT_MM", "/usr/share/fonts/truetype/noto/NotoSansMyanmar-Bold.ttf")
-FONT_LAT = os.environ.get("FONT_LAT", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf")
+# Railway volume ရှိရင် အဲဒီနေရာကိုသုံးမယ်။
+# Volume မရှိရင် project ထဲက jobs folder ကိုသုံးမယ်။
+_storage_path = (
+    os.environ.get("JOBS_DIR")
+    or os.environ.get("RAILWAY_VOLUME_MOUNT_PATH")
+)
 
-# Cleanup after 24 hours
-JOB_TTL_HOURS = 24
+if _storage_path:
+    JOBS_DIR = Path(_storage_path).resolve()
+else:
+    JOBS_DIR = (BASE_DIR / "jobs").resolve()
+
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+FONT_NAME = os.environ.get("SUBTITLE_FONT_NAME", "Noto Sans Myanmar")
+FONTS_DIR = os.environ.get(
+    "FONTS_DIR",
+    "/usr/share/fonts/truetype/noto"
+)
+
+JOB_TTL_HOURS = int(os.environ.get("JOB_TTL_HOURS", "24"))
+MAX_HISTORY_IDS = 20
+VALID_JOB_ID = re.compile(r"^[a-f0-9]{12}$")
+
+
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def valid_job_id(job_id):
+    return bool(VALID_JOB_ID.fullmatch(job_id or ""))
+
+
+def read_status_file(status_file):
+    try:
+        return json.loads(status_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def write_json_atomic(path, data):
+    """
+    status API ကဖတ်နေချိန် status.json တစ်ဝက်တစ်ပျက်ဖြစ်မသွားအောင်
+    temporary file ရေးပြီး atomic replace လုပ်သည်။
+    """
+    temp_path = path.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(data, ensure_ascii=False),
+        encoding="utf-8"
+    )
+    os.replace(temp_path, path)
+
+
+def update_status(job_id, **changes):
+    job_dir = JOBS_DIR / job_id
+    status_file = job_dir / "status.json"
+
+    current = read_status_file(status_file) or {}
+    current.update(changes)
+    current["updated"] = now_iso()
+
+    write_json_atomic(status_file, current)
+    return current
+
+
+def parse_timestamp(value):
+    """
+    Supports:
+    00:01:23.456
+    00:01:23,456
+    01:23.456
+    01:23,456
+    """
+    value = value.strip().replace(",", ".")
+    parts = value.split(":")
+
+    try:
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+        elif len(parts) == 2:
+            hours = 0
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+        else:
+            return None
+
+        total = hours * 3600 + minutes * 60 + seconds
+        return max(0.0, total)
+    except ValueError:
+        return None
+
+
+def clean_subtitle_line(text):
+    text = re.sub(r"<[^>]*>", "", text)
+    text = html.unescape(text)
+    return text.strip()
 
 
 def parse_subtitles(path):
-    """Parse VTT or SRT, return list of (start_sec, end_sec, text)."""
-    with open(path, 'r', encoding='utf-8-sig') as f:
-        content = f.read()
+    """
+    Parse VTT or SRT subtitles.
 
+    Returns:
+        [
+            (start_seconds, end_seconds, ["line 1", "line 2"]),
+            ...
+        ]
+    """
+    content = Path(path).read_text(
+        encoding="utf-8-sig",
+        errors="replace"
+    )
+
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+
+    blocks = re.split(r"\n[ \t]*\n", content.strip())
     cues = []
-    is_vtt = content.strip().startswith("WEBVTT")
 
-    if is_vtt:
-        # VTT: 00:00:20.861 --> 00:00:21.121
-        pattern = r'(\d{2}):(\d{2}):(\d{2})\.(\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.(\d{3})\n(.*?)(?=\n\n|\Z)'
-    else:
-        # SRT: 00:00:20,861 --> 00:00:21,121
-        pattern = r'(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\s*-->\s*(\d{2}):(\d{2}):(\d{2})[,.](\d{3})\n(.*?)(?=\n\n|\Z)'
+    for block in blocks:
+        lines = [line.strip("\ufeff") for line in block.splitlines()]
 
-    for m in re.finditer(pattern, content, re.DOTALL):
-        h1, mi1, s1, ms1, h2, mi2, s2, ms2, text = m.groups()
-        start = int(h1)*3600 + int(mi1)*60 + int(s1) + int(ms1)/1000
-        end = int(h2)*3600 + int(mi2)*60 + int(s2) + int(ms2)/1000
-        # Clean text: remove tags, join lines
-        t = re.sub(r'<[^>]+>', '', text).strip().replace('\n', ' ')
-        if t:
-            cues.append((start, end, t))
+        timing_index = None
+        for index, line in enumerate(lines):
+            if "-->" in line:
+                timing_index = index
+                break
 
+        if timing_index is None:
+            continue
+
+        timing_line = lines[timing_index]
+        left, right = timing_line.split("-->", 1)
+
+        start_token = left.strip().split()[0] if left.strip() else ""
+        right_parts = right.strip().split()
+        end_token = right_parts[0] if right_parts else ""
+
+        start = parse_timestamp(start_token)
+        end = parse_timestamp(end_token)
+
+        if start is None or end is None or end <= start:
+            continue
+
+        text_lines = []
+        for line in lines[timing_index + 1:]:
+            cleaned = clean_subtitle_line(line)
+            if cleaned:
+                text_lines.append(cleaned)
+
+        if text_lines:
+            cues.append((start, end, text_lines))
+
+    cues.sort(key=lambda cue: cue[0])
     return cues
 
 
-def render_subtitle_png(text, out_path, fontsize=36):
+def ass_time(seconds):
     """
-    Render subtitle as PNG with per-script font selection.
-    - Myanmar (U+1000-U+109F): NotoSansMyanmar-Bold
-    - Latin/digits: DejaVuSans-Bold
-    - Black semi-transparent box, white text
-    - Position handled by ffmpeg overlay (bottom, standard cinema position)
+    Convert seconds to ASS timestamp:
+    H:MM:SS.cc
     """
-    from PIL import Image, ImageDraw, ImageFont
+    seconds = max(0.0, float(seconds))
+    total_centiseconds = int(round(seconds * 100))
 
-    SCALE = 2
-    fs = fontsize * SCALE
+    hours, remainder = divmod(total_centiseconds, 360000)
+    minutes, remainder = divmod(remainder, 6000)
+    secs, centiseconds = divmod(remainder, 100)
 
-    font_mm = ImageFont.truetype(FONT_MM, fs, layout_engine=ImageFont.Layout.RAQM)
-    font_lat = ImageFont.truetype(FONT_LAT, fs, layout_engine=ImageFont.Layout.RAQM)
-
-    def get_font(ch):
-        if '\u1000' <= ch <= '\u109f':
-            return font_mm
-        return font_lat
-
-    # Split text into runs by script for proper font rendering
-    runs = []
-    current_run = ""
-    current_font = None
-    for ch in text:
-        f = get_font(ch)
-        if f != current_font and current_run:
-            runs.append((current_run, current_font))
-            current_run = ""
-        current_font = f
-        current_run += ch
-    if current_run:
-        runs.append((current_run, current_font))
-
-    # Measure total width
-    tmp_img = Image.new('RGBA', (10, 10))
-    tmp_d = ImageDraw.Draw(tmp_img)
-    total_w = 0
-    max_h = 0
-    run_widths = []
-    for run_text, run_font in runs:
-        bbox = tmp_d.textbbox((0, 0), run_text, font=run_font)
-        w = bbox[2] - bbox[0]
-        h = bbox[3] - bbox[1]
-        run_widths.append((w, bbox))
-        total_w += w
-        max_h = max(max_h, h)
-
-    pad_x, pad_y = 24 * SCALE, 14 * SCALE
-    W = total_w + pad_x * 2
-    H = max_h + pad_y * 2
-
-    img = Image.new('RGBA', (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    # Semi-transparent black box
-    d.rectangle([0, 0, W-1, H-1], fill=(0, 0, 0, 160))
-
-    # Draw each run
-    x = pad_x
-    for (run_text, run_font), (w, bbox) in zip(runs, run_widths):
-        d.text((x - bbox[0], pad_y - bbox[1]), run_text, font=run_font, fill=(255, 255, 255, 255))
-        x += w
-
-    # Downscale to 1x for crispness
-    img = img.resize((W // SCALE, H // SCALE), Image.LANCZOS)
-    img.save(out_path)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centiseconds:02d}"
 
 
-def download_video(url, dest):
-    """Download video from URL with progress."""
-    r = requests.get(url, stream=True, timeout=30)
-    r.raise_for_status()
-    total = int(r.headers.get('content-length', 0))
-    downloaded = 0
-    with open(dest, 'wb') as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
-            downloaded += len(chunk)
-    return dest
+def escape_ass_text(text):
+    """
+    Prevent subtitle text from injecting ASS formatting commands.
+    """
+    text = text.replace("\\", r"\\")
+    text = text.replace("{", r"\{")
+    text = text.replace("}", r"\}")
+    return text
 
 
-def encode_job(job_id, video_url, sub_path, watermark_text=None):
-    """Background encoding job - uses segmented encoding for low memory."""
-    job_dir = JOBS_DIR / job_id
-    job_dir.mkdir(exist_ok=True)
-    status_file = job_dir / "status.json"
+def create_ass_subtitle(cues, output_path):
+    """
+    Create a resolution-independent ASS subtitle file.
 
-    def set_status(**kwargs):
-        s = {}
-        if status_file.exists():
-            s = json.loads(status_file.read_text())
-        s.update(kwargs)
-        s['updated'] = datetime.now().isoformat()
-        status_file.write_text(json.dumps(s))
+    PlayResY=1080 နဲ့ Fontsize=36 ဖြစ်တဲ့အတွက်:
+    - 1080p မှာ 36
+    - 720p မှာ 24 ဝန်းကျင်
+    - 480p မှာ 16 ဝန်းကျင်
 
-    def run_ffmpeg(cmd, desc="ffmpeg"):
-        """Run ffmpeg, capture stderr on failure."""
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            err = proc.stderr[-500:] if proc.stderr else "no output"
-            raise RuntimeError(f"{desc} failed (code {proc.returncode}): {err}")
-        return proc
+    ဒါကြောင့် မူရင်း fixed 36-pixel PNG ထက် ပုံမှန်အရွယ်ဖြစ်မယ်။
+    """
+    header = f"""[Script Info]
+Title: Video Subtitle Burner
+ScriptType: v4.00+
+PlayResX: 1920
+PlayResY: 1080
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{FONT_NAME},36,&H00FFFFFF,&H00FFFFFF,&H60000000,&H60000000,-1,0,0,0,100,100,0,0,3,4,0,2,60,60,48,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    events = []
+
+    for start, end, text_lines in cues:
+        cleaned_lines = [
+            escape_ass_text(line)
+            for line in text_lines
+            if line.strip()
+        ]
+
+        if not cleaned_lines:
+            continue
+
+        text = r"\N".join(cleaned_lines)
+
+        events.append(
+            "Dialogue: 0,"
+            f"{ass_time(start)},"
+            f"{ass_time(end)},"
+            "Default,,0,0,0,,"
+            f"{text}"
+        )
+
+    output_path.write_text(
+        header + "\n".join(events) + "\n",
+        encoding="utf-8"
+    )
+
+
+def download_video(url, destination):
+    """
+    Download remote video with connect/read timeout.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 13) "
+            "AppleWebKit/537.36 Chrome/120 Safari/537.36"
+        )
+    }
+
+    with requests.get(
+        url,
+        stream=True,
+        timeout=(20, 180),
+        allow_redirects=True,
+        headers=headers
+    ) as response:
+        response.raise_for_status()
+
+        with open(destination, "wb") as output:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    output.write(chunk)
+
+    if not destination.exists() or destination.stat().st_size < 1024:
+        raise RuntimeError("Downloaded video file is empty or invalid")
+
+    return destination
+
+
+def probe_duration(video_path):
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path)
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Cannot read video duration: "
+            + (result.stderr.strip() or "ffprobe failed")
+        )
 
     try:
-        set_status(status="downloading", progress=5)
+        duration = float(result.stdout.strip())
+    except ValueError as exc:
+        raise RuntimeError("Invalid video duration") from exc
 
-        # 1. Download video
-        video_path = job_dir / "input.mp4"
+    if duration <= 0:
+        raise RuntimeError("Video duration is zero or invalid")
+
+    return duration
+
+
+def escape_ffmpeg_filter_path(value):
+    """
+    Escape path characters for FFmpeg filter syntax.
+    """
+    value = str(value)
+    value = value.replace("\\", r"\\")
+    value = value.replace(":", r"\:")
+    value = value.replace("'", r"\'")
+    value = value.replace(",", r"\,")
+    value = value.replace("[", r"\[")
+    value = value.replace("]", r"\]")
+    return value
+
+
+def timestamp_to_seconds(value):
+    """
+    Parse FFmpeg progress value such as 00:01:23.456789.
+    """
+    try:
+        hours, minutes, seconds = value.strip().split(":")
+        return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def run_ffmpeg_with_progress(command, job_id, duration):
+    """
+    Run one continuous FFmpeg encode and update status.json.
+    """
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    recent_output = deque(maxlen=40)
+
+    if process.stdout is None:
+        raise RuntimeError("Unable to read FFmpeg output")
+
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        recent_output.append(line)
+
+        if line.startswith("out_time="):
+            encoded_seconds = timestamp_to_seconds(
+                line.split("=", 1)[1]
+            )
+
+            if duration > 0:
+                percent = 20 + int(
+                    min(encoded_seconds / duration, 1.0) * 75
+                )
+                update_status(
+                    job_id,
+                    status="encoding",
+                    progress=min(percent, 95)
+                )
+
+        elif line == "progress=end":
+            update_status(
+                job_id,
+                status="finalizing",
+                progress=97
+            )
+
+    return_code = process.wait()
+
+    if return_code != 0:
+        details = "\n".join(recent_output)
+        raise RuntimeError(
+            f"FFmpeg failed with code {return_code}: {details[-1500:]}"
+        )
+
+
+def encode_job(job_id, video_url, subtitle_path):
+    job_dir = JOBS_DIR / job_id
+    video_path = job_dir / "input.mp4"
+    ass_path = job_dir / "subtitles.ass"
+    output_path = job_dir / "output.mp4"
+
+    try:
+        update_status(
+            job_id,
+            status="downloading",
+            progress=5
+        )
+
         download_video(video_url, video_path)
 
-        # Get duration
-        dur_proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
-            capture_output=True, text=True
+        update_status(
+            job_id,
+            status="probing",
+            progress=10
         )
-        duration = float(dur_proc.stdout.strip())
-        set_status(status="parsing", progress=10, duration=duration)
 
-        # 2. Parse subtitles
-        cues = parse_subtitles(sub_path)
+        duration = probe_duration(video_path)
+
+        update_status(
+            job_id,
+            status="preparing",
+            progress=15,
+            duration=duration
+        )
+
+        cues = parse_subtitles(subtitle_path)
+
         if not cues:
-            raise ValueError("No subtitles found in file")
-        set_status(status="rendering", progress=15, total_cues=len(cues))
+            raise ValueError(
+                "No valid subtitles were found in the uploaded file"
+            )
 
-        # 3. Render PNGs
-        png_dir = job_dir / "pngs"
-        png_dir.mkdir(exist_ok=True)
-        png_files = []
-        for i, (start, end, text) in enumerate(cues):
-            png_path = png_dir / f"sub_{i:04d}.png"
-            render_subtitle_png(text, str(png_path))
-            png_files.append((str(png_path), start, end))
-            if i % 50 == 0:
-                set_status(progress=15 + int(10 * i / len(cues)))
+        create_ass_subtitle(cues, ass_path)
 
-        # 4. Per-group encoding (minimal resources: 2-5 inputs per ffmpeg run)
-        # Railway $5 free tier: even 119 inputs hits "Resource temporarily unavailable"
-        # Strategy: group nearby cues, one ffmpeg run per group (few PNG inputs),
-        # stream-copy gaps, concat everything at the end.
-        set_status(status="encoding", progress=25)
-        seg_dir = job_dir / "segs"
-        seg_dir.mkdir(exist_ok=True)
+        update_status(
+            job_id,
+            status="encoding",
+            progress=20,
+            total_cues=len(cues)
+        )
 
-        # Group cues: merge if gap < 2 seconds, max 20 cues per group
-        # (keeps ffmpeg input count low for Railway free tier)
-        MAX_GROUP = 20
-        groups = []
-        cur_group = []
-        for p, s, e in png_files:
-            if cur_group and (s - cur_group[-1][2] > 2.0 or len(cur_group) >= MAX_GROUP):
-                groups.append(cur_group)
-                cur_group = []
-            cur_group.append((p, s, e))
-        if cur_group:
-            groups.append(cur_group)
+        ass_filter_path = escape_ffmpeg_filter_path(ass_path)
+        fonts_filter_path = escape_ffmpeg_filter_path(FONTS_DIR)
 
-        set_status(total_groups=len(groups))
+        subtitle_filter = (
+            f"subtitles=filename='{ass_filter_path}':"
+            f"fontsdir='{fonts_filter_path}'"
+        )
 
-        # Build timeline: alternate between subtitle groups and gaps
-        # Each timeline piece: (start, end, png_list_or_None)
-        pieces = []
-        prev_end = 0
-        for g in groups:
-            gs = g[0][1]
-            ge = g[-1][2]
-            if gs > prev_end + 0.1:
-                pieces.append((prev_end, gs, None))  # gap: stream copy
-            pieces.append((gs, ge, g))  # subtitles: re-encode
-            prev_end = ge
-        if prev_end < duration - 0.1:
-            pieces.append((prev_end, duration, None))
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel", "error",
 
-        seg_files = []
-        for idx, (ps, pe, plist) in enumerate(pieces):
-            pdur = pe - ps
-            if pdur < 0.1:
-                continue
-            seg_out = seg_dir / f"seg_{idx:04d}.mp4"
+            "-i", str(video_path),
 
-            if plist is None:
-                # Gap: stream copy (fast)
-                run_ffmpeg([
-                    "ffmpeg", "-y", "-ss", f"{ps:.3f}", "-i", str(video_path),
-                    "-t", f"{pdur:.3f}", "-c", "copy", str(seg_out)
-                ], f"gap {idx}")
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+
+            "-vf", subtitle_filter,
+
+            # Video ကို တစ်ခါတည်း encode လုပ်တာကြောင့်
+            # segment boundary timestamp ပြဿနာမရှိတော့ပါ။
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "21",
+            "-pix_fmt", "yuv420p",
+            "-threads", "2",
+
+            # Browser/device compatibility အတွက် AAC သုံးသည်။
+            "-c:a", "aac",
+            "-b:a", "128k",
+
+            # Input variable frame rate/timestamps ကို မလိုအပ်ဘဲ
+            # fixed FPS အဖြစ် force မလုပ်ရန်။
+            "-fps_mode", "passthrough",
+
+            "-map_metadata", "0",
+            "-map_chapters", "0",
+            "-avoid_negative_ts", "make_zero",
+            "-max_muxing_queue_size", "2048",
+            "-movflags", "+faststart",
+
+            "-progress", "pipe:1",
+            "-nostats",
+
+            str(output_path)
+        ]
+
+        run_ffmpeg_with_progress(
+            command,
+            job_id,
+            duration
+        )
+
+        if (
+            not output_path.exists()
+            or output_path.stat().st_size < 1000
+        ):
+            raise RuntimeError("Output video was not created correctly")
+
+        # Output နဲ့ status ပဲထားပြီး input/intermediate files ဖျက်မယ်။
+        video_path.unlink(missing_ok=True)
+        ass_path.unlink(missing_ok=True)
+        Path(subtitle_path).unlink(missing_ok=True)
+
+        update_status(
+            job_id,
+            status="done",
+            progress=100,
+            output=output_path.name,
+            size=output_path.stat().st_size
+        )
+
+    except Exception as exc:
+        update_status(
+            job_id,
+            status="error",
+            progress=0,
+            error=str(exc)[:1500]
+        )
+
+
+def cleanup_old_jobs():
+    now = datetime.now()
+    removed = 0
+
+    if not JOBS_DIR.exists():
+        return removed
+
+    for job_dir in JOBS_DIR.iterdir():
+        if not job_dir.is_dir():
+            continue
+
+        status_file = job_dir / "status.json"
+        status_data = read_status_file(status_file)
+
+        try:
+            if status_data and status_data.get("created"):
+                created = datetime.fromisoformat(
+                    status_data["created"]
+                )
             else:
-                # Two-step: extract raw segment, then burn subtitles
-                # (avoids -ss + filter_complex interaction issues)
-                raw_seg = seg_dir / f"raw_{idx:04d}.mp4"
-                run_ffmpeg([
-                    "ffmpeg", "-y", "-ss", f"{ps:.3f}", "-i", str(video_path),
-                    "-t", f"{pdur:.3f}", "-c", "copy", str(raw_seg)
-                ], f"extract {idx}")
+                created = datetime.fromtimestamp(
+                    job_dir.stat().st_mtime
+                )
 
-                # Burn subtitles (no seeking, times are 0-based)
-                filter_parts = []
-                prev = "[0:v]"
-                png_inputs = []
-                for j, (png_path, s, e) in enumerate(plist):
-                    rs = max(s - ps, 0)
-                    re_ = min(e - ps, pdur)
-                    png_inputs += ["-i", png_path]
-                    out = f"[s{j}]" if j < len(plist) - 1 else "[vout]"
-                    filter_parts.append(
-                        f"{prev}[{j+1}:v]overlay=x=(W-w)/2:y=H-h-60:"
-                        f"enable='between(t,{rs:.3f},{re_:.3f})'{out}"
-                    )
-                    prev = out
+            if now - created > timedelta(hours=JOB_TTL_HOURS):
+                shutil.rmtree(job_dir, ignore_errors=True)
+                removed += 1
+        except (ValueError, OSError):
+            continue
 
-                run_ffmpeg([
-                    "ffmpeg", "-y",
-                    "-i", str(raw_seg),
-                    *png_inputs,
-                    "-filter_complex", ";".join(filter_parts),
-                    "-map", "[vout]", "-map", "0:a?",
-                    "-c:v", "libx264", "-crf", "21", "-preset", "veryfast",
-                    "-c:a", "aac", "-b:a", "128k",
-                    str(seg_out)
-                ], f"burn {idx} ({len(plist)} cues)")
-                raw_seg.unlink(missing_ok=True)
-
-            seg_files.append(seg_out)
-            set_status(progress=25 + int(65 * (idx + 1) / len(pieces)))
-
-        # 5. Concat all segments (stream copy, no re-encode)
-        set_status(status="merging", progress=92)
-        concat_list = job_dir / "concat.txt"
-        concat_list.write_text("\n".join(f"file 'segs/{f.name}'" for f in seg_files))
-        output_path = job_dir / "output.mp4"
-        run_ffmpeg([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_list), "-c", "copy",
-            "-movflags", "+faststart", str(output_path)
-        ], "final concat")
-
-        # Verify
-        if not output_path.exists() or output_path.stat().st_size < 1000:
-            raise RuntimeError("Output file not created")
-
-        # Cleanup intermediates to save disk
-        shutil.rmtree(png_dir, ignore_errors=True)
-        shutil.rmtree(seg_dir, ignore_errors=True)
-
-        set_status(status="done", progress=100,
-                   output=str(output_path.name),
-                   size=output_path.stat().st_size)
-
-    except Exception as e:
-        set_status(status="error", error=str(e)[:500])
+    return removed
 
 
-@app.route('/')
+@app.route("/")
 def index():
-    return render_template('index.html')
+    return render_template("index.html")
 
 
-@app.route('/api/submit', methods=['POST'])
+@app.route("/api/submit", methods=["POST"])
 def submit():
-    video_url = request.form.get('video_url', '').strip()
+    video_url = request.form.get("video_url", "").strip()
+
     if not video_url:
         return jsonify({"error": "Video URL required"}), 400
 
-    if 'subtitle' not in request.files:
+    if not re.match(r"^https?://", video_url, re.IGNORECASE):
+        return jsonify({
+            "error": "Video URL must start with http:// or https://"
+        }), 400
+
+    if "subtitle" not in request.files:
         return jsonify({"error": "Subtitle file required"}), 400
 
-    sub_file = request.files['subtitle']
-    if not sub_file.filename:
+    subtitle_file = request.files["subtitle"]
+
+    if not subtitle_file.filename:
         return jsonify({"error": "No subtitle file selected"}), 400
 
-    ext = Path(sub_file.filename).suffix.lower()
-    if ext not in ['.vtt', '.srt']:
-        return jsonify({"error": "Only VTT or SRT files supported"}), 400
+    extension = Path(subtitle_file.filename).suffix.lower()
+
+    if extension not in {".vtt", ".srt"}:
+        return jsonify({
+            "error": "Only VTT or SRT subtitle files are supported"
+        }), 400
+
+    cleanup_old_jobs()
 
     job_id = uuid.uuid4().hex[:12]
     job_dir = JOBS_DIR / job_id
-    job_dir.mkdir(exist_ok=True)
+    job_dir.mkdir(parents=True, exist_ok=False)
 
-    sub_path = job_dir / f"sub{ext}"
-    sub_file.save(str(sub_path))
+    subtitle_path = job_dir / f"subtitle{extension}"
+    subtitle_file.save(str(subtitle_path))
 
-    # Start background encoding
-    thread = threading.Thread(
-        target=encode_job,
-        args=(job_id, video_url, str(sub_path)),
-        daemon=True
+    # Thread မစခင် status file အရင်ရေးရမယ်။
+    # မူရင်း code မှာ thread စပြီးမှ queued ရေးထားတာကြောင့်
+    # downloading status ကို queued ကပြန်ဖုံးနိုင်တဲ့ race ရှိတယ်။
+    write_json_atomic(
+        job_dir / "status.json",
+        {
+            "job_id": job_id,
+            "status": "queued",
+            "progress": 0,
+            "created": now_iso(),
+            "updated": now_iso()
+        }
     )
-    thread.start()
 
-    (job_dir / "status.json").write_text(json.dumps({
-        "status": "queued", "progress": 0,
-        "created": datetime.now().isoformat()
-    }))
+    worker = threading.Thread(
+        target=encode_job,
+        args=(job_id, video_url, str(subtitle_path)),
+        daemon=True,
+        name=f"encode-{job_id}"
+    )
+    worker.start()
 
     return jsonify({"job_id": job_id})
 
 
-@app.route('/api/status/<job_id>')
+@app.route("/api/status/<job_id>")
 def status(job_id):
+    if not valid_job_id(job_id):
+        return jsonify({"error": "Invalid job ID"}), 400
+
     status_file = JOBS_DIR / job_id / "status.json"
-    if not status_file.exists():
+    status_data = read_status_file(status_file)
+
+    if status_data is None:
         return jsonify({"error": "Job not found"}), 404
-    return jsonify(json.loads(status_file.read_text()))
+
+    return jsonify(status_data)
 
 
-@app.route('/api/download/<job_id>')
-def download(job_id):
-    job_dir = JOBS_DIR / job_id
-    output = job_dir / "output.mp4"
-    if not output.exists():
-        return jsonify({"error": "File not ready"}), 404
-    return send_file(str(output), as_attachment=True,
-                     download_name="subtitled.mp4",
-                     mimetype="video/mp4")
+@app.route("/api/jobs")
+def jobs():
+    raw_ids = request.args.get("ids", "")
+    requested_ids = raw_ids.split(",")[:MAX_HISTORY_IDS]
 
+    result = []
 
-@app.route('/api/cleanup', methods=['POST'])
-def cleanup():
-    """Remove old jobs."""
-    now = datetime.now()
-    removed = 0
-    for job_dir in JOBS_DIR.iterdir():
-        if not job_dir.is_dir():
+    for job_id in requested_ids:
+        job_id = job_id.strip()
+
+        if not valid_job_id(job_id):
             continue
-        status_file = job_dir / "status.json"
-        if status_file.exists():
-            try:
-                s = json.loads(status_file.read_text())
-                created = datetime.fromisoformat(s.get('created', ''))
-                if now - created > timedelta(hours=JOB_TTL_HOURS):
-                    shutil.rmtree(job_dir)
-                    removed += 1
-            except:
-                pass
+
+        status_file = JOBS_DIR / job_id / "status.json"
+        status_data = read_status_file(status_file)
+
+        if status_data:
+            status_data["job_id"] = job_id
+            result.append(status_data)
+        else:
+            result.append({
+                "job_id": job_id,
+                "status": "missing",
+                "progress": 0
+            })
+
+    return jsonify({"jobs": result})
+
+
+@app.route("/api/download/<job_id>")
+def download(job_id):
+    if not valid_job_id(job_id):
+        return jsonify({"error": "Invalid job ID"}), 400
+
+    output_path = JOBS_DIR / job_id / "output.mp4"
+
+    if not output_path.exists():
+        return jsonify({"error": "File not ready"}), 404
+
+    return send_file(
+        str(output_path),
+        as_attachment=True,
+        download_name=f"subtitled-{job_id}.mp4",
+        mimetype="video/mp4",
+        conditional=True
+    )
+
+
+@app.route("/api/cleanup", methods=["POST"])
+def cleanup():
+    removed = cleanup_old_jobs()
     return jsonify({"removed": removed})
 
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True
+    )
