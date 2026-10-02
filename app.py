@@ -397,7 +397,7 @@ PADAUK_BOLD = "/usr/share/fonts/truetype/padauk/Padauk-Bold.ttf"
 PADAUK_REGULAR = "/usr/share/fonts/truetype/padauk/Padauk-Regular.ttf"
 DEJAVU_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
-SUBTITLE_FONT_SIZE = 48  # Normal cinema subtitle size for 720p
+SUBTITLE_FONT_SIZE = 32  # Compact subtitle size for 720p
 
 
 def _is_myanmar(char):
@@ -417,48 +417,77 @@ def _get_font_for_text(text, size):
         return ImageFont.load_default()
 
 
+def _wrap_text_to_lines(text, font, max_width, draw):
+    """Wrap text into multiple lines that fit max_width. Wraps on spaces."""
+    words = text.split(" ")
+    lines = []
+    cur = ""
+    for w in words:
+        test = (cur + " " + w).strip()
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] - bbox[0] <= max_width:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines if lines else [text]
+
+
 def render_subtitle_png(text_lines, output_path, video_width=1280):
-    """Render subtitle cue as transparent PNG with black backing box."""
+    """Render subtitle cue as transparent PNG.
+
+    Style: yellow text with thick black outline/shadow, no background box.
+    Long lines are wrapped to fit within video width.
+    """
     font = _get_font_for_text(" ".join(text_lines), SUBTITLE_FONT_SIZE)
 
-    # Measure text
     tmp_img = Image.new("RGBA", (10, 10))
     tmp_draw = ImageDraw.Draw(tmp_img)
+
+    # Wrap long lines to fit video width
+    max_text_w = video_width - 120
+    wrapped = []
+    for line in text_lines:
+        bbox = tmp_draw.textbbox((0, 0), line, font=font)
+        if bbox[2] - bbox[0] > max_text_w:
+            wrapped.extend(_wrap_text_to_lines(line, font, max_text_w, tmp_draw))
+        else:
+            wrapped.append(line)
+    # Limit to 3 lines max
+    wrapped = wrapped[:3]
+
+    # Measure
     line_heights = []
     line_widths = []
-    for line in text_lines:
+    for line in wrapped:
         bbox = tmp_draw.textbbox((0, 0), line, font=font)
         line_widths.append(bbox[2] - bbox[0])
         line_heights.append(bbox[3] - bbox[1])
 
     max_w = max(line_widths) if line_widths else 10
-    total_h = sum(line_heights) + (len(text_lines) - 1) * 8
+    total_h = sum(line_heights) + (len(wrapped) - 1) * 6
 
-    pad_x, pad_y = 24, 14
-    img_w = min(max_w + pad_x * 2, video_width - 40)
-    img_h = total_h + pad_y * 2
+    pad = 8
+    img_w = max_w + pad * 2
+    img_h = total_h + pad * 2
 
     img = Image.new("RGBA", (img_w, img_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
-    # Semi-transparent black backing box
-    draw.rounded_rectangle(
-        [(0, 0), (img_w - 1, img_h - 1)],
-        radius=12,
-        fill=(0, 0, 0, 160),
-    )
-
-    # Draw text lines centered
-    y = pad_y
-    for i, line in enumerate(text_lines):
+    # Yellow text with thick black outline (no background box)
+    y = pad
+    for i, line in enumerate(wrapped):
         lw = line_widths[i]
         x = (img_w - lw) // 2
-        # White text with subtle outline for readability
         draw.text(
-            (x, y), line, font=font, fill=(255, 255, 255, 255),
-            stroke_width=2, stroke_fill=(0, 0, 0, 200),
+            (x, y), line, font=font,
+            fill=(255, 235, 59, 255),  # Yellow
+            stroke_width=3, stroke_fill=(0, 0, 0, 255),
         )
-        y += line_heights[i] + 8
+        y += line_heights[i] + 6
 
     img.save(output_path)
     return output_path
