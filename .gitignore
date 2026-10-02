@@ -1,4 +1,12 @@
 jobs/
 __pycache__/
 *.pyc
+
 .env
+.env.*
+!.env.example
+
+*.mp4
+*.ass
+*.srt
+*.vtt
