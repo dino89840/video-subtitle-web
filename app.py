@@ -218,10 +218,10 @@ def create_ass_subtitle(cues, output_path):
     """
     Create a resolution-independent ASS subtitle file.
 
-    PlayResY=1080 နဲ့ Fontsize=36 ဖြစ်တဲ့အတွက်:
-    - 1080p မှာ 36
-    - 720p မှာ 24 ဝန်းကျင်
-    - 480p မှာ 16 ဝန်းကျင်
+    PlayResY=1080 နဲ့ Fontsize=72 ဖြစ်တဲ့အတွက်:
+    - 1080p မှာ 72
+    - 720p မှာ 48 ဝန်းကျင် (ပုံမှန် စာတန်းဆိုဒ်)
+    - 480p မှာ 32 ဝန်းကျင်
 
     ဒါကြောင့် မူရင်း fixed 36-pixel PNG ထက် ပုံမှန်အရွယ်ဖြစ်မယ်။
     """
@@ -236,7 +236,7 @@ YCbCr Matrix: TV.709
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{FONT_NAME},36,&H00FFFFFF,&H00FFFFFF,&H60000000,&H60000000,-1,0,0,0,100,100,0,0,3,4,0,2,60,60,48,1
+Style: Default,{FONT_NAME},72,&H00FFFFFF,&H00FFFFFF,&H60000000,&H60000000,-1,0,0,0,100,100,0,0,3,4,0,2,60,60,48,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
