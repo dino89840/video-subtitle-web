@@ -1,4 +1,4 @@
-# Railway Dockerfile - includes ffmpeg + Myanmar fonts
+# Railway Dockerfile - includes ffmpeg + Myanmar fonts   
 FROM python:3.12-slim
 
 # Install ffmpeg and fonts
