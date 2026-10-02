@@ -210,11 +210,13 @@ def encode_job(job_id, video_url, sub_path, watermark_text=None):
         seg_dir = job_dir / "segs"
         seg_dir.mkdir(exist_ok=True)
 
-        # Group cues: merge if gap < 2 seconds
+        # Group cues: merge if gap < 2 seconds, max 20 cues per group
+        # (keeps ffmpeg input count low for Railway free tier)
+        MAX_GROUP = 20
         groups = []
         cur_group = []
         for p, s, e in png_files:
-            if cur_group and s - cur_group[-1][2] > 2.0:
+            if cur_group and (s - cur_group[-1][2] > 2.0 or len(cur_group) >= MAX_GROUP):
                 groups.append(cur_group)
                 cur_group = []
             cur_group.append((p, s, e))
@@ -251,7 +253,15 @@ def encode_job(job_id, video_url, sub_path, watermark_text=None):
                     "-t", f"{pdur:.3f}", "-c", "copy", str(seg_out)
                 ], f"gap {idx}")
             else:
-                # Subtitles: few PNG inputs (typically 1-5)
+                # Two-step: extract raw segment, then burn subtitles
+                # (avoids -ss + filter_complex interaction issues)
+                raw_seg = seg_dir / f"raw_{idx:04d}.mp4"
+                run_ffmpeg([
+                    "ffmpeg", "-y", "-ss", f"{ps:.3f}", "-i", str(video_path),
+                    "-t", f"{pdur:.3f}", "-c", "copy", str(raw_seg)
+                ], f"extract {idx}")
+
+                # Burn subtitles (no seeking, times are 0-based)
                 filter_parts = []
                 prev = "[0:v]"
                 png_inputs = []
@@ -268,15 +278,15 @@ def encode_job(job_id, video_url, sub_path, watermark_text=None):
 
                 run_ffmpeg([
                     "ffmpeg", "-y",
-                    "-ss", f"{ps:.3f}", "-i", str(video_path),
+                    "-i", str(raw_seg),
                     *png_inputs,
-                    "-t", f"{pdur:.3f}",
                     "-filter_complex", ";".join(filter_parts),
                     "-map", "[vout]", "-map", "0:a?",
                     "-c:v", "libx264", "-crf", "21", "-preset", "veryfast",
                     "-c:a", "aac", "-b:a", "128k",
                     str(seg_out)
-                ], f"subs {idx} ({len(plist)} cues)")
+                ], f"burn {idx} ({len(plist)} cues)")
+                raw_seg.unlink(missing_ok=True)
 
             seg_files.append(seg_out)
             set_status(progress=25 + int(65 * (idx + 1) / len(pieces)))
