@@ -148,7 +148,7 @@ def download_video(url, dest):
 
 
 def encode_job(job_id, video_url, sub_path, watermark_text=None):
-    """Background encoding job."""
+    """Background encoding job - uses segmented encoding for low memory."""
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(exist_ok=True)
     status_file = job_dir / "status.json"
@@ -161,19 +161,35 @@ def encode_job(job_id, video_url, sub_path, watermark_text=None):
         s['updated'] = datetime.now().isoformat()
         status_file.write_text(json.dumps(s))
 
+    def run_ffmpeg(cmd, desc="ffmpeg"):
+        """Run ffmpeg, capture stderr on failure."""
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            err = proc.stderr[-500:] if proc.stderr else "no output"
+            raise RuntimeError(f"{desc} failed (code {proc.returncode}): {err}")
+        return proc
+
     try:
         set_status(status="downloading", progress=5)
 
         # 1. Download video
         video_path = job_dir / "input.mp4"
         download_video(video_url, video_path)
-        set_status(status="parsing", progress=15)
+
+        # Get duration
+        dur_proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+            capture_output=True, text=True
+        )
+        duration = float(dur_proc.stdout.strip())
+        set_status(status="parsing", progress=10, duration=duration)
 
         # 2. Parse subtitles
         cues = parse_subtitles(sub_path)
         if not cues:
             raise ValueError("No subtitles found in file")
-        set_status(status="rendering", progress=20, total_cues=len(cues))
+        set_status(status="rendering", progress=15, total_cues=len(cues))
 
         # 3. Render PNGs
         png_dir = job_dir / "pngs"
@@ -184,86 +200,92 @@ def encode_job(job_id, video_url, sub_path, watermark_text=None):
             render_subtitle_png(text, str(png_path))
             png_files.append((str(png_path), start, end))
             if i % 50 == 0:
-                set_status(progress=20 + int(20 * i / len(cues)))
+                set_status(progress=15 + int(10 * i / len(cues)))
 
-        set_status(status="encoding", progress=45)
+        # 4. Segmented encoding (low memory: small filter graph per run)
+        # Split video into 5-minute segments to keep ffmpeg memory low
+        # (Railway $5 free tier has limited RAM; 369-input filter crashes)
+        SEG_LEN = 300  # 5 minutes
+        num_segs = int((duration + SEG_LEN - 1) // SEG_LEN)
+        seg_files = []
 
-        # 4. Build ffmpeg filter
-        # Position: centered, 60px from bottom (standard cinema position)
-        filter_parts = []
-        prev = "[0:v]"
-        for i, (png_path, start, end) in enumerate(png_files):
-            idx = i + 1
-            out = f"[s{i}]" if i < len(png_files) - 1 else "[vout]"
-            filter_parts.append(
-                f"{prev}[{idx}:v]overlay=x=(W-w)/2:y=H-h-60:"
-                f"enable='between(t,{start:.3f},{end:.3f})'{out}"
-            )
-            prev = out
+        set_status(status="encoding", progress=25)
+        seg_dir = job_dir / "segs"
+        seg_dir.mkdir(exist_ok=True)
 
-        # Watermark (optional)
-        inputs = ["-i", str(video_path)]
-        for png_path, _, _ in png_files:
-            inputs += ["-i", png_path]
+        for seg_idx in range(num_segs):
+            seg_start = seg_idx * SEG_LEN
+            seg_end = min((seg_idx + 1) * SEG_LEN, duration)
+            seg_dur = seg_end - seg_start
 
+            # Find cues overlapping this segment, adjust to segment-relative time
+            seg_cues = [(p, max(s - seg_start, 0), min(e - seg_start, seg_dur))
+                        for p, s, e in png_files
+                        if s < seg_end and e > seg_start]
+
+            seg_out = seg_dir / f"seg_{seg_idx:03d}.mp4"
+
+            if not seg_cues:
+                # No subtitles in this segment: stream copy (fast, no re-encode)
+                run_ffmpeg([
+                    "ffmpeg", "-y", "-ss", str(seg_start), "-i", str(video_path),
+                    "-t", str(seg_dur), "-c", "copy", str(seg_out)
+                ], f"segment {seg_idx} copy")
+            else:
+                # Burn this segment's subtitles (typically <60 overlays)
+                filter_parts = []
+                prev = "[0:v]"
+                png_inputs = []
+                for j, (png_path, s, e) in enumerate(seg_cues):
+                    idx = j + 1
+                    png_inputs += ["-i", png_path]
+                    out = f"[s{j}]" if j < len(seg_cues) - 1 else "[vout]"
+                    filter_parts.append(
+                        f"{prev}[{idx}:v]overlay=x=(W-w)/2:y=H-h-60:"
+                        f"enable='between(t,{s:.3f},{e:.3f})'{out}"
+                    )
+                    prev = out
+
+                run_ffmpeg([
+                    "ffmpeg", "-y",
+                    "-ss", str(seg_start), "-i", str(video_path),
+                    *png_inputs,
+                    "-t", str(seg_dur),
+                    "-filter_complex", ";".join(filter_parts),
+                    "-map", "[vout]", "-map", "0:a?",
+                    "-c:v", "libx264", "-crf", "21", "-preset", "fast",
+                    "-c:a", "aac", "-b:a", "128k",
+                    str(seg_out)
+                ], f"segment {seg_idx} encode ({len(seg_cues)} subs)")
+
+            seg_files.append(seg_out)
+            set_status(progress=25 + int(65 * (seg_idx + 1) / num_segs))
+
+        # 5. Concat all segments (stream copy, no re-encode)
+        set_status(status="merging", progress=92)
+        concat_list = job_dir / "concat.txt"
+        concat_list.write_text("\n".join(f"file 'segs/{f.name}'" for f in seg_files))
         output_path = job_dir / "output.mp4"
+        run_ffmpeg([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_list), "-c", "copy",
+            "-movflags", "+faststart", str(output_path)
+        ], "final concat")
 
-        # Get video info for quality matching
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height,avg_frame_rate",
-             "-of", "default=noprint_wrappers=1", str(video_path)],
-            capture_output=True, text=True
-        )
-
-        # Encode: CRF 21 (near-original quality), preserve resolution
-        cmd = ["ffmpeg", "-y"] + inputs + [
-            "-filter_complex", ";".join(filter_parts),
-            "-map", "[vout]", "-map", "0:a?",
-            "-c:v", "libx264", "-crf", "21", "-preset", "fast",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            str(output_path)
-        ]
-
-        # Run with progress monitoring
-        proc = subprocess.Popen(cmd, stderr=subprocess.PIPE,
-                                universal_newlines=True, bufsize=1)
-
-        # Get duration for progress
-        dur_proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
-            capture_output=True, text=True
-        )
-        try:
-            duration = float(dur_proc.stdout.strip())
-        except:
-            duration = 1
-
-        for line in proc.stderr:
-            # Parse time= from ffmpeg output
-            m = re.search(r'time=(\d+):(\d+):(\d+\.\d+)', line)
-            if m:
-                h, mi, s = m.groups()
-                t = int(h)*3600 + int(mi)*60 + float(s)
-                pct = 45 + int(50 * t / duration)
-                set_status(progress=min(pct, 95))
-
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg failed with code {proc.returncode}")
-
-        # Verify output
+        # Verify
         if not output_path.exists() or output_path.stat().st_size < 1000:
-            raise RuntimeError("Output file not created or too small")
+            raise RuntimeError("Output file not created")
+
+        # Cleanup intermediates to save disk
+        shutil.rmtree(png_dir, ignore_errors=True)
+        shutil.rmtree(seg_dir, ignore_errors=True)
 
         set_status(status="done", progress=100,
                    output=str(output_path.name),
                    size=output_path.stat().st_size)
 
     except Exception as e:
-        set_status(status="error", error=str(e))
+        set_status(status="error", error=str(e)[:500])
 
 
 @app.route('/')
