@@ -1355,8 +1355,9 @@ def encode_job(job_id, video_url, subtitle_path):
                 total_cues=len(cues),
             )
 
-            # --- Single-pass PNG overlay using movie filter ---
-            # (No segmenting = no freeze/speedup; no input limit)
+            # --- Segmented PNG overlay (all re-encoded, no stream copy) ---
+            # Re-encoding everything avoids timestamp discontinuities
+            # that caused freezing with mixed copy/encode segments.
             update_status(
                 job_id,
                 status="encoding",
@@ -1364,56 +1365,129 @@ def encode_job(job_id, video_url, subtitle_path):
                 total_cues=len(cues),
             )
 
-            # Build filter chain: each PNG loaded via movie filter,
-            # overlaid with enable timing. Only 1 ffmpeg input needed.
-            filter_parts = []
-            prev_label = "0:v"
-            for j, (png_path, s, e) in enumerate(png_files):
-                # Escape path for movie filter
-                esc_path = png_path.replace("\\", "/").replace(":", "\\:")
-                esc_path = esc_path.replace("'", "\\'")
-                ov_label = f"ov{j}"
-                out_label = f"v{j+1}" if j < len(png_files) - 1 else "vout"
-                filter_parts.append(
-                    f"movie=filename='{esc_path}'[{ov_label}]"
+            # Group cues: max 15 per group (safe ffmpeg input count)
+            MAX_GROUP = 15
+            groups = []
+            cur_group = []
+            for p, s, e in png_files:
+                if cur_group and len(cur_group) >= MAX_GROUP:
+                    groups.append(cur_group)
+                    cur_group = []
+                cur_group.append((p, s, e))
+            if cur_group:
+                groups.append(cur_group)
+
+            # Build timeline pieces
+            seg_dir = job_dir / "segments"
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            pieces = []
+            cursor = 0.0
+            for g in groups:
+                gs = g[0][1]
+                ge = g[-1][2]
+                if gs > cursor + 0.05:
+                    pieces.append((cursor, gs, None))
+                pieces.append((gs, ge, g))
+                cursor = ge
+            if cursor < duration - 0.05:
+                pieces.append((cursor, duration, None))
+
+            # Encode each piece (ALL re-encoded with identical settings)
+            seg_files = []
+            total_pieces = len(pieces)
+            for idx, (ps, pe, plist) in enumerate(pieces):
+                pdur = pe - ps
+                if pdur <= 0:
+                    continue
+                seg_out = seg_dir / f"seg_{idx:04d}.mp4"
+                seg_files.append(str(seg_out))
+
+                prog = 15 + int(70 * idx / max(total_pieces, 1))
+                update_status(
+                    job_id, status="encoding",
+                    progress=min(prog, 85),
                 )
-                filter_parts.append(
-                    f"[{prev_label}][{ov_label}]"
-                    f"overlay=x=(W-w)/2:y=H-h-60:"
-                    f"enable='between(t,{s:.3f},{e:.3f})'"
-                    f"[{out_label}]"
-                )
-                prev_label = out_label
 
-            filter_complex = ";".join(filter_parts)
+                if plist is None:
+                    # Gap: re-encode (not stream copy) for clean concat
+                    run_ffmpeg_simple([
+                        "ffmpeg", "-y", "-hide_banner",
+                        "-loglevel", "error",
+                        "-ss", f"{ps:.3f}",
+                        "-i", str(input_path),
+                        "-t", f"{pdur:.3f}",
+                        "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "21", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-avoid_negative_ts", "make_zero",
+                        str(seg_out),
+                    ], f"gap {idx}")
+                else:
+                    # Subtitle segment: extract then burn PNGs
+                    raw_seg = seg_dir / f"raw_{idx:04d}.mp4"
+                    run_ffmpeg_simple([
+                        "ffmpeg", "-y", "-hide_banner",
+                        "-loglevel", "error",
+                        "-ss", f"{ps:.3f}",
+                        "-i", str(input_path),
+                        "-t", f"{pdur:.3f}",
+                        "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "21", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-avoid_negative_ts", "make_zero",
+                        str(raw_seg),
+                    ], f"extract {idx}")
 
-            # Single ffmpeg pass: stream video, overlay all PNGs, encode
-            update_status(job_id, status="encoding", progress=20)
-            run_ffmpeg_to_file(
-                [
-                    "ffmpeg", "-y", "-hide_banner",
-                    "-loglevel", "error",
-                    "-i", str(input_path),
-                    "-filter_complex", filter_complex,
-                    "-map", "[vout]", "-map", "0:a?",
-                    "-c:v", "libx264", "-preset", "veryfast",
-                    "-crf", "21", "-pix_fmt", "yuv420p",
-                    "-threads", "2",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-fps_mode", "passthrough",
-                    "-map_metadata", "-1",
-                    "-movflags", "+faststart",
-                    "-progress", "pipe:2",
-                    "-nostats",
-                    str(output_path),
-                ],
-                output_path,
-                job_id,
-                duration,
-            )
+                    # Overlay PNGs (max 15 inputs - safe)
+                    filter_parts = []
+                    prev = "[0:v]"
+                    png_inputs = []
+                    for j, (png_path, s, e) in enumerate(plist):
+                        rs = max(s - ps, 0)
+                        re_ = min(e - ps, pdur)
+                        png_inputs += ["-i", png_path]
+                        out = f"[s{j}]" if j < len(plist) - 1 else "[vout]"
+                        filter_parts.append(
+                            f"{prev}[{j+1}:v]overlay="
+                            f"x=(W-w)/2:y=H-h-60:"
+                            f"enable='between(t,{rs:.3f},{re_:.3f})'{out}"
+                        )
+                        prev = out
 
-            # Cleanup temp files to save disk
+                    run_ffmpeg_simple([
+                        "ffmpeg", "-y", "-hide_banner",
+                        "-loglevel", "error",
+                        "-i", str(raw_seg),
+                        *png_inputs,
+                        "-filter_complex", ";".join(filter_parts),
+                        "-map", "[vout]", "-map", "0:a?",
+                        "-c:v", "libx264", "-preset", "veryfast",
+                        "-crf", "21", "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "128k",
+                        "-avoid_negative_ts", "make_zero",
+                        str(seg_out),
+                    ], f"burn {idx} ({len(plist)} cues)")
+                    raw_seg.unlink(missing_ok=True)
+
+            # Concat all re-encoded segments
+            update_status(job_id, status="encoding", progress=88)
+            concat_list = seg_dir / "concat.txt"
+            with open(concat_list, "w") as cf:
+                for sf in seg_files:
+                    cf.write(f"file '{sf}'\n")
+
+            run_ffmpeg_simple([
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "concat", "-safe", "0",
+                "-i", str(concat_list),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                str(output_path),
+            ], "concat")
+
+            # Cleanup
             shutil.rmtree(png_dir, ignore_errors=True)
+            shutil.rmtree(seg_dir, ignore_errors=True)
             input_path.unlink(missing_ok=True)
 
             update_status(job_id, status="encoding", progress=90)
