@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="my">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Video Subtitle Burner</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: sans-serif; background: #1a1a2e; color: #eee;
+         min-height: 100vh; padding: 20px; }
+  .container { max-width: 600px; margin: 0 auto; }
+  h1 { text-align: center; margin-bottom: 30px; color: #ffd700; }
+  .card { background: #16213e; border-radius: 12px; padding: 25px;
+          margin-bottom: 20px; }
+  label { display: block; margin-bottom: 8px; font-weight: bold; }
+  input[type=url], input[type=file] {
+    width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #333;
+    background: #0f0f23; color: #eee; margin-bottom: 20px; font-size: 16px;
+  }
+  input[type=file] { cursor: pointer; }
+  button {
+    width: 100%; padding: 14px; border: none; border-radius: 8px;
+    background: #ffd700; color: #1a1a2e; font-size: 18px; font-weight: bold;
+    cursor: pointer;
+  }
+  button:disabled { background: #555; cursor: not-allowed; }
+  .progress { display: none; margin-top: 20px; }
+  .bar-bg { background: #0f0f23; border-radius: 8px; height: 24px; overflow: hidden; }
+  .bar { background: #ffd700; height: 100%; width: 0%; transition: width 0.5s;
+         border-radius: 8px; }
+  .status-text { text-align: center; margin-top: 10px; font-size: 16px; }
+  .download { display: none; text-align: center; margin-top: 20px; }
+  .download a {
+    display: inline-block; padding: 14px 40px; background: #4caf50;
+    color: white; text-decoration: none; border-radius: 8px;
+    font-size: 18px; font-weight: bold;
+  }
+  .error { color: #ff6b6b; text-align: center; margin-top: 15px; }
+  .hint { font-size: 13px; color: #888; margin-top: -15px; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🎬 Video Subtitle Burner</h1>
+
+  <div class="card">
+    <label>Video URL (remote link)</label>
+    <input type="url" id="videoUrl" placeholder="https://example.com/video.mp4">
+    <div class="hint">Direct link to the video file (mp4)</div>
+
+    <label>Subtitle File (VTT / SRT from your phone)</label>
+    <input type="file" id="subFile" accept=".vtt,.srt">
+
+    <button id="submitBtn" onclick="submitJob()">Encode Video</button>
+
+    <div class="progress" id="progressDiv">
+      <div class="bar-bg"><div class="bar" id="bar"></div></div>
+      <div class="status-text" id="statusText">Starting...</div>
+    </div>
+
+    <div class="download" id="downloadDiv">
+      <a id="downloadLink" href="#">⬇ Download Video</a>
+      <div class="hint" style="margin-top:10px">Link expires after 24 hours</div>
+    </div>
+
+    <div class="error" id="errorDiv"></div>
+  </div>
+</div>
+
+<script>
+let jobId = null;
+let pollTimer = null;
+
+async function submitJob() {
+  const url = document.getElementById('videoUrl').value.trim();
+  const file = document.getElementById('subFile').files[0];
+  const err = document.getElementById('errorDiv');
+  err.textContent = '';
+
+  if (!url) { err.textContent = 'Please enter a video URL'; return; }
+  if (!file) { err.textContent = 'Please select a subtitle file'; return; }
+
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+
+  const fd = new FormData();
+  fd.append('video_url', url);
+  fd.append('subtitle', file);
+
+  try {
+    const r = await fetch('/api/submit', { method: 'POST', body: fd });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    jobId = d.job_id;
+    document.getElementById('progressDiv').style.display = 'block';
+    document.getElementById('downloadDiv').style.display = 'none';
+    pollStatus();
+  } catch (e) {
+    err.textContent = e.message;
+    btn.disabled = false;
+    btn.textContent = 'Encode Video';
+  }
+}
+
+async function pollStatus() {
+  try {
+    const r = await fetch('/api/status/' + jobId);
+    const d = await r.json();
+
+    const bar = document.getElementById('bar');
+    const txt = document.getElementById('statusText');
+    bar.style.width = (d.progress || 0) + '%';
+
+    const labels = {
+      queued: 'Queued...', downloading: 'Downloading video...',
+      parsing: 'Parsing subtitles...', rendering: 'Rendering subtitles...',
+      encoding: 'Encoding video...', done: 'Done!', error: 'Error'
+    };
+    txt.textContent = (labels[d.status] || d.status) + ' ' + (d.progress || 0) + '%';
+
+    if (d.status === 'done') {
+      clearInterval(pollTimer);
+      document.getElementById('downloadDiv').style.display = 'block';
+      document.getElementById('downloadLink').href = '/api/download/' + jobId;
+      const btn = document.getElementById('submitBtn');
+      btn.disabled = false;
+      btn.textContent = 'Encode Another';
+    } else if (d.status === 'error') {
+      clearInterval(pollTimer);
+      document.getElementById('errorDiv').textContent = 'Error: ' + d.error;
+      const btn = document.getElementById('submitBtn');
+      btn.disabled = false;
+      btn.textContent = 'Encode Video';
+    } else {
+      pollTimer = setTimeout(pollStatus, 3000);
+    }
+  } catch (e) {
+    pollTimer = setTimeout(pollStatus, 5000);
+  }
+}
+</script>
+</body>
+</html>
