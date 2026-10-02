@@ -1456,15 +1456,15 @@ def index():
 @app.route("/api/submit", methods=["POST"])
 def submit():
     if not bunny_is_configured():
-    return jsonify({
-        "error": (
-            "Bunny storage is not configured. "
-            "Add BUNNY_STORAGE_ZONE, "
-            "BUNNY_STORAGE_PASSWORD, "
-            "BUNNY_STORAGE_HOSTNAME and "
-            "BUNNY_CDN_HOSTNAME in Railway."
-        )
-    }), 503
+        return jsonify({
+            "error": (
+                "Bunny storage is not configured. "
+                "Add BUNNY_STORAGE_ZONE, "
+                "BUNNY_STORAGE_PASSWORD, "
+                "BUNNY_STORAGE_HOSTNAME and "
+                "BUNNY_CDN_HOSTNAME in Railway."
+            )
+        }), 503
 
 
     video_url = request.form.get(
