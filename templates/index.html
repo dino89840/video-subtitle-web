@@ -267,7 +267,7 @@
       Direct video file link ထည့်ပါ။ HTTP သို့မဟုတ် HTTPS link ဖြစ်ရမယ်။
     </div>
 
-    <label for="subFile">Subtitle File (VTT / SRT)</label>
+    <label for="subFile">Subtitle File (VTT / SRT) — မထည့်လည်းရတယ်</label>
 
     <input
       type="file"
@@ -590,9 +590,10 @@ async function submitJob() {
     return;
   }
 
-  if (!subtitleFile) {
-    errorDiv.textContent = 'Subtitle file ရွေးပါ။';
-    return;
+  const formData = new FormData();
+  formData.append('video_url', videoUrl);
+  if (subtitleFile) {
+    formData.append('subtitle', subtitleFile);
   }
 
   setButtonBusy();
@@ -602,10 +603,6 @@ async function submitJob() {
   document.getElementById('bar').style.width = '0%';
   document.getElementById('statusText').textContent =
     'Server သို့တင်နေသည်...';
-
-  const formData = new FormData();
-  formData.append('video_url', videoUrl);
-  formData.append('subtitle', subtitleFile);
   const watermarkOn = document.getElementById('watermarkToggle').checked;
   formData.append('watermark', watermarkOn ? '1' : '0');
   const introOn = document.getElementById('introToggle').checked;
