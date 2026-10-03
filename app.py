@@ -1384,7 +1384,7 @@ def _probe_video_width(video_path):
         return None
 
 
-def encode_job(job_id, video_url, subtitle_path):
+def encode_job(job_id, video_url, subtitle_path, watermark_enabled=True):
     job_dir = JOBS_DIR / job_id
     ass_path = job_dir / "subtitles.ass"
     output_path = job_dir / "output.mp4"
@@ -1458,7 +1458,8 @@ def encode_job(job_id, video_url, subtitle_path):
 
             # Render watermark and intro PNGs
             watermark_png = str(job_dir / "watermark.png")
-            render_watermark_png(watermark_png)
+            if watermark_enabled:
+                render_watermark_png(watermark_png)
             intro_png = str(job_dir / "intro.png")
             render_intro_png(intro_png, video_width)
 
@@ -1523,38 +1524,61 @@ def encode_job(job_id, video_url, subtitle_path):
                 )
 
                 if plist is None:
-                    # Gap: re-encode with watermark (+ intro if 0-10s)
+                    # Gap: re-encode with watermark (optional) + intro (if 0-10s)
                     gap_filter = []
-                    gap_inputs = ["-i", watermark_png, "-i", intro_png]
-                    gap_filter.append(
-                        "[0:v][1:v]overlay=x=W-w-20:y=20[wm]"
-                    )
+                    gap_inputs = []
+                    prev = "[0:v]"
+                    next_idx = 1
+
+                    if watermark_enabled:
+                        gap_inputs += ["-i", watermark_png]
+                        gap_filter.append(
+                            f"{prev}[{next_idx}:v]overlay="
+                            f"x=W-w-20:y=20[wm]"
+                        )
+                        prev = "[wm]"
+                        next_idx += 1
+
+                    gap_inputs += ["-i", intro_png]
                     intro_s = max(0 - ps, 0)
                     intro_e = min(10 - ps, pdur)
                     if intro_e > intro_s + 0.1:
                         gap_filter.append(
-                            f"[wm][2:v]overlay=x=(W-w)/2:y=H-h-60:"
-                            f"enable='between(t,{intro_s:.3f},{intro_e:.3f})'"
+                            f"{prev}[{next_idx}:v]overlay="
+                            f"x=(W-w)/2:y=H-h-60:"
+                            f"enable='between(t,{intro_s:.3f},"
+                            f"{intro_e:.3f})'"
                             f"[vout]"
                         )
                         vmap = "[vout]"
+                    elif prev != "[0:v]":
+                        vmap = prev
                     else:
-                        vmap = "[wm]"
-                    run_ffmpeg_simple([
+                        # No watermark, no intro: plain re-encode
+                        gap_filter = None
+                        vmap = "0:v"
+
+                    gap_cmd = [
                         "ffmpeg", "-y", "-hide_banner",
                         "-loglevel", "error",
                         "-ss", f"{ps:.3f}",
                         "-i", str(input_path),
                         *gap_inputs,
                         "-t", f"{pdur:.3f}",
-                        "-filter_complex", ";".join(gap_filter),
+                    ]
+                    if gap_filter:
+                        gap_cmd += [
+                            "-filter_complex", ";".join(gap_filter),
+                        ]
+                    gap_cmd += [
                         "-map", vmap, "-map", "0:a?",
                         "-c:v", "libx264", "-preset", "veryfast",
                         "-crf", "21", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-b:a", "128k",
                         "-avoid_negative_ts", "make_zero",
                         str(seg_out),
-                    ], f"gap {idx}")
+                    ]
+                    run_ffmpeg_simple(gap_cmd, f"gap {idx}")
                 else:
                     # Subtitle segment: extract then burn PNGs
                     raw_seg = seg_dir / f"raw_{idx:04d}.mp4"
@@ -1588,18 +1612,19 @@ def encode_job(job_id, video_url, subtitle_path):
                         )
                         prev = out
 
-                    # Add watermark and intro as inputs
-                    wm_idx = len(png_inputs) // 2 + 1
-                    png_inputs += ["-i", watermark_png]
-                    intro_idx = wm_idx + 1
-                    png_inputs += ["-i", intro_png]
+                    # Add watermark (optional) and intro as inputs
+                    if watermark_enabled:
+                        wm_idx = len(png_inputs) // 2 + 1
+                        png_inputs += ["-i", watermark_png]
+                        # Watermark: top-right, entire segment
+                        filter_parts.append(
+                            f"{prev}[{wm_idx}:v]overlay="
+                            f"x=W-w-20:y=20[wm]"
+                        )
+                        prev = "[wm]"
 
-                    # Watermark: top-right, entire segment
-                    filter_parts.append(
-                        f"{prev}[{wm_idx}:v]overlay="
-                        f"x=W-w-20:y=20[wm]"
-                    )
-                    prev = "[wm]"
+                    intro_idx = len(png_inputs) // 2 + 1
+                    png_inputs += ["-i", intro_png]
 
                     # Intro: center, only if segment overlaps 0-10s
                     # (times relative to segment start)
@@ -1884,6 +1909,9 @@ def submit():
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=False)
 
+    # Watermark toggle (default on)
+    watermark_enabled = request.form.get("watermark", "1") == "1"
+
     # Subtitle file is optional - watermark+intro always applied
     subtitle_file = request.files.get("subtitle")
     subtitle_path = None
@@ -1921,6 +1949,7 @@ def submit():
             job_id,
             video_url,
             str(subtitle_path),
+            watermark_enabled,
         ),
         daemon=True,
         name=f"encode-{job_id}",

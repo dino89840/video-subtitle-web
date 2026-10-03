@@ -275,6 +275,16 @@
       accept=".vtt,.srt,text/vtt,application/x-subrip"
     >
 
+    <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; margin-top: 4px;">
+      <input
+        type="checkbox"
+        id="watermarkToggle"
+        checked
+        style="width: 20px; height: 20px; accent-color: #facc15;"
+      >
+      <span>Watermark ထည့်မယ် (အပေါ်ညာဘက်)</span>
+    </label>
+
     <button id="submitBtn" type="button">
       Encode Video
     </button>
@@ -586,6 +596,8 @@ async function submitJob() {
   const formData = new FormData();
   formData.append('video_url', videoUrl);
   formData.append('subtitle', subtitleFile);
+  const watermarkOn = document.getElementById('watermarkToggle').checked;
+  formData.append('watermark', watermarkOn ? '1' : '0');
 
   try {
     const response = await fetch('/api/submit', {
