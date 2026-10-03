@@ -540,37 +540,43 @@ def render_watermark_png(output_path):
 
 
 def render_intro_png(output_path, video_width=1280):
-    """Render intro: link in cyan + suffix in white, centered."""
+    """Render intro: link in cyan + suffix in white, baseline-aligned."""
     font_link = _get_font_for_text(INTRO_LINK, 44)
     font_suffix = _get_font_for_text(INTRO_SUFFIX, 44)
     tmp = Image.new("RGBA", (10, 10))
     d = ImageDraw.Draw(tmp)
-    # Measure both parts
-    b1 = d.textbbox((0, 0), INTRO_LINK, font=font_link, stroke_width=3)
-    b2 = d.textbbox((0, 0), INTRO_SUFFIX, font=font_suffix, stroke_width=3)
-    w1, h1 = b1[2] - b1[0], b1[3] - b1[1]
-    w2, h2 = b2[2] - b2[0], b2[3] - b2[1]
+    # Measure with baseline anchor for proper alignment
+    b1 = d.textbbox((0, 0), INTRO_LINK, font=font_link,
+                     stroke_width=3, anchor="ls")
+    b2 = d.textbbox((0, 0), INTRO_SUFFIX, font=font_suffix,
+                     stroke_width=3, anchor="ls")
+    w1 = b1[2] - b1[0]
+    w2 = b2[2] - b2[0]
+    # Height: from top of tallest ascender to bottom of deepest descender
+    top = min(b1[1], b2[1])
+    bottom = max(b1[3], b2[3])
+    h = bottom - top
     gap = 16
     total_w = w1 + gap + w2
-    max_h = max(h1, h2)
     pad = 20
     img = Image.new(
-        "RGBA", (total_w + pad * 2, max_h + pad * 2), (0, 0, 0, 0)
+        "RGBA", (total_w + pad * 2, h + pad * 2), (0, 0, 0, 0)
     )
     draw = ImageDraw.Draw(img)
-    x = pad
-    y = pad
-    # Link in cyan
+    # Baseline y (same for both = aligned)
+    baseline_y = pad - top
+    x = pad - b1[0]
+    # Link in cyan (anchor ls = left-baseline)
     draw.text(
-        (x - b1[0], y - b1[1]), INTRO_LINK, font=font_link,
-        fill=(0, 229, 255, 255),  # Cyan
+        (x, baseline_y), INTRO_LINK, font=font_link,
+        fill=(0, 229, 255, 255), anchor="ls",
         stroke_width=3, stroke_fill=(0, 0, 0, 255),
     )
-    x += w1 + gap
-    # Suffix in white
+    x += w1 + gap - b2[0] + b1[0]
+    # Suffix in white (same baseline)
     draw.text(
-        (x - b2[0], y - b2[1]), INTRO_SUFFIX, font=font_suffix,
-        fill=(255, 255, 255, 255),  # White
+        (x, baseline_y), INTRO_SUFFIX, font=font_suffix,
+        fill=(255, 255, 255, 255), anchor="ls",
         stroke_width=3, stroke_fill=(0, 0, 0, 255),
     )
     img.save(output_path)
@@ -1420,15 +1426,12 @@ def encode_job(job_id, video_url, subtitle_path):
                 duration=duration,
             )
 
-            cues = parse_subtitles(
-                subtitle_path
-            )
-
-            if not cues:
-                raise ValueError(
-                    "No valid subtitles were found "
-                    "in the uploaded file"
+            cues = []
+            if subtitle_path and Path(subtitle_path).exists():
+                cues = parse_subtitles(
+                    subtitle_path
                 )
+            # Subtitles are optional - watermark+intro always applied
 
             # --- PNG subtitle rendering (correct Myanmar shaping) ---
             update_status(
@@ -1446,9 +1449,12 @@ def encode_job(job_id, video_url, subtitle_path):
             # Get video dimensions for PNG sizing
             video_width = _probe_video_width(input_path) or 1280
 
-            # Render all subtitle PNGs
+            # Render all subtitle PNGs (if any)
             png_dir = job_dir / "pngs"
-            png_files = render_all_subtitles(cues, png_dir, video_width)
+            png_files = (
+                render_all_subtitles(cues, png_dir, video_width)
+                if cues else []
+            )
 
             # Render watermark and intro PNGs
             watermark_png = str(job_dir / "watermark.png")
@@ -1477,7 +1483,7 @@ def encode_job(job_id, video_url, subtitle_path):
             MAX_GROUP = 15
             groups = []
             cur_group = []
-            for p, s, e in png_files:
+            for p, s, e in (png_files or []):
                 if cur_group and len(cur_group) >= MAX_GROUP:
                     groups.append(cur_group)
                     cur_group = []
@@ -1527,7 +1533,7 @@ def encode_job(job_id, video_url, subtitle_path):
                     intro_e = min(10 - ps, pdur)
                     if intro_e > intro_s + 0.1:
                         gap_filter.append(
-                            f"[wm][2:v]overlay=x=(W-w)/2:y=(H-h)/2-40:"
+                            f"[wm][2:v]overlay=x=(W-w)/2:y=H-h-60:"
                             f"enable='between(t,{intro_s:.3f},{intro_e:.3f})'"
                             f"[vout]"
                         )
@@ -1602,7 +1608,7 @@ def encode_job(job_id, video_url, subtitle_path):
                     if intro_e > intro_s + 0.1:
                         filter_parts.append(
                             f"{prev}[{intro_idx}:v]overlay="
-                            f"x=(W-w)/2:y=(H-h)/2-40:"
+                            f"x=(W-w)/2:y=H-h-60:"
                             f"enable='between(t,{intro_s:.3f},{intro_e:.3f})'"
                             f"[vout]"
                         )
@@ -1869,29 +1875,25 @@ def submit():
             )
         }), 400
 
-    if "subtitle" not in request.files:
-        return jsonify({
-            "error": "Subtitle file required"
-        }), 400
+    # Subtitle file is optional - watermark+intro always applied
+    subtitle_file = request.files.get("subtitle")
+    subtitle_path = None
+    if subtitle_file and subtitle_file.filename:
+        extension = Path(
+            subtitle_file.filename
+        ).suffix.lower()
 
-    subtitle_file = request.files["subtitle"]
+        if extension not in {".vtt", ".srt"}:
+            return jsonify({
+                "error": (
+                    "Only VTT or SRT subtitle "
+                    "files are supported"
+                )
+            }), 400
 
-    if not subtitle_file.filename:
-        return jsonify({
-            "error": "No subtitle file selected"
-        }), 400
-
-    extension = Path(
-        subtitle_file.filename
-    ).suffix.lower()
-
-    if extension not in {".vtt", ".srt"}:
-        return jsonify({
-            "error": (
-                "Only VTT or SRT subtitle "
-                "files are supported"
-            )
-        }), 400
+        subtitle_path = str(job_dir / "subtitles.vtt")
+        subtitle_file.save(subtitle_path)
+    # No subtitle file = watermark + intro only
 
     try:
         cleanup_old_jobs()
