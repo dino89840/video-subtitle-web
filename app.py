@@ -1875,6 +1875,15 @@ def submit():
             )
         }), 400
 
+    try:
+        cleanup_old_jobs()
+    except Exception:
+        pass
+
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=False)
+
     # Subtitle file is optional - watermark+intro always applied
     subtitle_file = request.files.get("subtitle")
     subtitle_path = None
@@ -1894,18 +1903,6 @@ def submit():
         subtitle_path = str(job_dir / "subtitles.vtt")
         subtitle_file.save(subtitle_path)
     # No subtitle file = watermark + intro only
-
-    try:
-        cleanup_old_jobs()
-    except Exception:
-        pass
-
-    job_id = uuid.uuid4().hex[:12]
-    job_dir = JOBS_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=False)
-
-    subtitle_path = job_dir / f"subtitle{extension}"
-    subtitle_file.save(str(subtitle_path))
 
     write_json_atomic(
         job_dir / "status.json",
