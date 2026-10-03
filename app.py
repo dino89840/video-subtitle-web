@@ -1384,7 +1384,7 @@ def _probe_video_width(video_path):
         return None
 
 
-def encode_job(job_id, video_url, subtitle_path, watermark_enabled=True):
+def encode_job(job_id, video_url, subtitle_path, watermark_enabled=True, intro_enabled=True):
     job_dir = JOBS_DIR / job_id
     ass_path = job_dir / "subtitles.ass"
     output_path = job_dir / "output.mp4"
@@ -1461,7 +1461,8 @@ def encode_job(job_id, video_url, subtitle_path, watermark_enabled=True):
             if watermark_enabled:
                 render_watermark_png(watermark_png)
             intro_png = str(job_dir / "intro.png")
-            render_intro_png(intro_png, video_width)
+            if intro_enabled:
+                render_intro_png(intro_png, video_width)
 
             update_status(
                 job_id,
@@ -1524,7 +1525,7 @@ def encode_job(job_id, video_url, subtitle_path, watermark_enabled=True):
                 )
 
                 if plist is None:
-                    # Gap: re-encode with watermark (optional) + intro (if 0-10s)
+                    # Gap: re-encode with watermark (optional) + intro (optional, if 0-10s)
                     gap_filter = []
                     gap_inputs = []
                     prev = "[0:v]"
@@ -1539,18 +1540,26 @@ def encode_job(job_id, video_url, subtitle_path, watermark_enabled=True):
                         prev = "[wm]"
                         next_idx += 1
 
-                    gap_inputs += ["-i", intro_png]
-                    intro_s = max(0 - ps, 0)
-                    intro_e = min(10 - ps, pdur)
-                    if intro_e > intro_s + 0.1:
-                        gap_filter.append(
-                            f"{prev}[{next_idx}:v]overlay="
-                            f"x=(W-w)/2:y=H-h-60:"
-                            f"enable='between(t,{intro_s:.3f},"
-                            f"{intro_e:.3f})'"
-                            f"[vout]"
-                        )
-                        vmap = "[vout]"
+                    if intro_enabled:
+                        gap_inputs += ["-i", intro_png]
+                        intro_s = max(0 - ps, 0)
+                        intro_e = min(10 - ps, pdur)
+                        if intro_e > intro_s + 0.1:
+                            gap_filter.append(
+                                f"{prev}[{next_idx}:v]overlay="
+                                f"x=(W-w)/2:y=H-h-60:"
+                                f"enable='between(t,{intro_s:.3f},"
+                                f"{intro_e:.3f})'"
+                                f"[vout]"
+                            )
+                            vmap = "[vout]"
+                            next_idx += 1
+                        elif prev != "[0:v]":
+                            vmap = prev
+                        else:
+                            # No filters at all: plain re-encode
+                            gap_filter = None
+                            vmap = "0:v"
                     elif prev != "[0:v]":
                         vmap = prev
                     else:
@@ -1612,7 +1621,7 @@ def encode_job(job_id, video_url, subtitle_path, watermark_enabled=True):
                         )
                         prev = out
 
-                    # Add watermark (optional) and intro as inputs
+                    # Add watermark (optional) and intro (optional) as inputs
                     if watermark_enabled:
                         wm_idx = len(png_inputs) // 2 + 1
                         png_inputs += ["-i", watermark_png]
@@ -1623,20 +1632,23 @@ def encode_job(job_id, video_url, subtitle_path, watermark_enabled=True):
                         )
                         prev = "[wm]"
 
-                    intro_idx = len(png_inputs) // 2 + 1
-                    png_inputs += ["-i", intro_png]
+                    if intro_enabled:
+                        intro_idx = len(png_inputs) // 2 + 1
+                        png_inputs += ["-i", intro_png]
 
-                    # Intro: center, only if segment overlaps 0-10s
-                    # (times relative to segment start)
-                    intro_s = max(0 - ps, 0)
-                    intro_e = min(10 - ps, pdur)
-                    if intro_e > intro_s + 0.1:
-                        filter_parts.append(
-                            f"{prev}[{intro_idx}:v]overlay="
-                            f"x=(W-w)/2:y=H-h-60:"
-                            f"enable='between(t,{intro_s:.3f},{intro_e:.3f})'"
-                            f"[vout]"
-                        )
+                        # Intro: center, only if segment overlaps 0-10s
+                        # (times relative to segment start)
+                        intro_s = max(0 - ps, 0)
+                        intro_e = min(10 - ps, pdur)
+                        if intro_e > intro_s + 0.1:
+                            filter_parts.append(
+                                f"{prev}[{intro_idx}:v]overlay="
+                                f"x=(W-w)/2:y=H-h-60:"
+                                f"enable='between(t,{intro_s:.3f},{intro_e:.3f})'"
+                                f"[vout]"
+                            )
+                        else:
+                            filter_parts.append(f"{prev}null[vout]")
                     else:
                         filter_parts.append(f"{prev}null[vout]")
 
@@ -1911,6 +1923,8 @@ def submit():
 
     # Watermark toggle (default on)
     watermark_enabled = request.form.get("watermark", "1") == "1"
+    # Intro toggle (default on)
+    intro_enabled = request.form.get("intro", "1") == "1"
 
     # Subtitle file is optional - watermark+intro always applied
     subtitle_file = request.files.get("subtitle")
@@ -1950,6 +1964,7 @@ def submit():
             video_url,
             str(subtitle_path),
             watermark_enabled,
+            intro_enabled,
         ),
         daemon=True,
         name=f"encode-{job_id}",

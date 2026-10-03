@@ -285,6 +285,16 @@
       <span>Watermark ထည့်မယ် (အပေါ်ညာဘက်)</span>
     </label>
 
+    <label style="display: flex; align-items: center; gap: 10px; cursor: pointer; margin-top: 4px;">
+      <input
+        type="checkbox"
+        id="introToggle"
+        checked
+        style="width: 20px; height: 20px; accent-color: #facc15;"
+      >
+      <span>တင်ဆက်သည် စာတန်း ထည့်မယ် (အစ 10 စက္ကန့်)</span>
+    </label>
+
     <button id="submitBtn" type="button">
       Encode Video
     </button>
@@ -598,6 +608,8 @@ async function submitJob() {
   formData.append('subtitle', subtitleFile);
   const watermarkOn = document.getElementById('watermarkToggle').checked;
   formData.append('watermark', watermarkOn ? '1' : '0');
+  const introOn = document.getElementById('introToggle').checked;
+  formData.append('intro', introOn ? '1' : '0');
 
   try {
     const response = await fetch('/api/submit', {
