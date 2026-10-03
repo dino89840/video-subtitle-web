@@ -512,6 +512,71 @@ def render_all_subtitles(cues, png_dir, video_width=1280):
     return result
 
 
+
+WATERMARK_TEXT = "lugyiapplication.vercel.app"
+INTRO_LINK = "lugyiapplication.vercel.app"
+INTRO_SUFFIX = "မှ တင်ဆက်သည်"
+
+
+def render_watermark_png(output_path):
+    """Render top-right watermark: white text with heavy black shadow."""
+    font = _get_font_for_text(WATERMARK_TEXT, 28)
+    tmp = Image.new("RGBA", (10, 10))
+    d = ImageDraw.Draw(tmp)
+    bbox = d.textbbox((0, 0), WATERMARK_TEXT, font=font, stroke_width=3)
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    pad = 12
+    img = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    # Heavy black shadow for visibility on white scenes
+    draw.text(
+        (pad - bbox[0], pad - bbox[1]), WATERMARK_TEXT, font=font,
+        fill=(255, 255, 255, 255),
+        stroke_width=3, stroke_fill=(0, 0, 0, 255),
+    )
+    # Extra dark glow behind
+    img.save(output_path)
+    return output_path
+
+
+def render_intro_png(output_path, video_width=1280):
+    """Render intro: link in cyan + suffix in white, centered."""
+    font_link = _get_font_for_text(INTRO_LINK, 44)
+    font_suffix = _get_font_for_text(INTRO_SUFFIX, 44)
+    tmp = Image.new("RGBA", (10, 10))
+    d = ImageDraw.Draw(tmp)
+    # Measure both parts
+    b1 = d.textbbox((0, 0), INTRO_LINK, font=font_link, stroke_width=3)
+    b2 = d.textbbox((0, 0), INTRO_SUFFIX, font=font_suffix, stroke_width=3)
+    w1, h1 = b1[2] - b1[0], b1[3] - b1[1]
+    w2, h2 = b2[2] - b2[0], b2[3] - b2[1]
+    gap = 16
+    total_w = w1 + gap + w2
+    max_h = max(h1, h2)
+    pad = 20
+    img = Image.new(
+        "RGBA", (total_w + pad * 2, max_h + pad * 2), (0, 0, 0, 0)
+    )
+    draw = ImageDraw.Draw(img)
+    x = pad
+    y = pad
+    # Link in cyan
+    draw.text(
+        (x - b1[0], y - b1[1]), INTRO_LINK, font=font_link,
+        fill=(0, 229, 255, 255),  # Cyan
+        stroke_width=3, stroke_fill=(0, 0, 0, 255),
+    )
+    x += w1 + gap
+    # Suffix in white
+    draw.text(
+        (x - b2[0], y - b2[1]), INTRO_SUFFIX, font=font_suffix,
+        fill=(255, 255, 255, 255),  # White
+        stroke_width=3, stroke_fill=(0, 0, 0, 255),
+    )
+    img.save(output_path)
+    return output_path
+
+
 def run_ffmpeg_simple(command, label):
     """Run ffmpeg without progress tracking (for segments)."""
     result = subprocess.run(
@@ -1385,6 +1450,12 @@ def encode_job(job_id, video_url, subtitle_path):
             png_dir = job_dir / "pngs"
             png_files = render_all_subtitles(cues, png_dir, video_width)
 
+            # Render watermark and intro PNGs
+            watermark_png = str(job_dir / "watermark.png")
+            render_watermark_png(watermark_png)
+            intro_png = str(job_dir / "intro.png")
+            render_intro_png(intro_png, video_width)
+
             update_status(
                 job_id,
                 status="encoding",
@@ -1446,13 +1517,32 @@ def encode_job(job_id, video_url, subtitle_path):
                 )
 
                 if plist is None:
-                    # Gap: re-encode (not stream copy) for clean concat
+                    # Gap: re-encode with watermark (+ intro if 0-10s)
+                    gap_filter = []
+                    gap_inputs = ["-i", watermark_png, "-i", intro_png]
+                    gap_filter.append(
+                        "[0:v][1:v]overlay=x=W-w-20:y=20[wm]"
+                    )
+                    intro_s = max(0 - ps, 0)
+                    intro_e = min(10 - ps, pdur)
+                    if intro_e > intro_s + 0.1:
+                        gap_filter.append(
+                            f"[wm][2:v]overlay=x=(W-w)/2:y=(H-h)/2-40:"
+                            f"enable='between(t,{intro_s:.3f},{intro_e:.3f})'"
+                            f"[vout]"
+                        )
+                        vmap = "[vout]"
+                    else:
+                        vmap = "[wm]"
                     run_ffmpeg_simple([
                         "ffmpeg", "-y", "-hide_banner",
                         "-loglevel", "error",
                         "-ss", f"{ps:.3f}",
                         "-i", str(input_path),
+                        *gap_inputs,
                         "-t", f"{pdur:.3f}",
+                        "-filter_complex", ";".join(gap_filter),
+                        "-map", vmap, "-map", "0:a?",
                         "-c:v", "libx264", "-preset", "veryfast",
                         "-crf", "21", "-pix_fmt", "yuv420p",
                         "-c:a", "aac", "-b:a", "128k",
@@ -1476,6 +1566,7 @@ def encode_job(job_id, video_url, subtitle_path):
                     ], f"extract {idx}")
 
                     # Overlay PNGs (max 15 inputs - safe)
+                    # + watermark (top-right, always) + intro (0-10s)
                     filter_parts = []
                     prev = "[0:v]"
                     png_inputs = []
@@ -1483,13 +1574,40 @@ def encode_job(job_id, video_url, subtitle_path):
                         rs = max(s - ps, 0)
                         re_ = min(e - ps, pdur)
                         png_inputs += ["-i", png_path]
-                        out = f"[s{j}]" if j < len(plist) - 1 else "[vout]"
+                        out = f"[s{j}]"
                         filter_parts.append(
                             f"{prev}[{j+1}:v]overlay="
                             f"x=(W-w)/2:y=H-h-60:"
                             f"enable='between(t,{rs:.3f},{re_:.3f})'{out}"
                         )
                         prev = out
+
+                    # Add watermark and intro as inputs
+                    wm_idx = len(png_inputs) // 2 + 1
+                    png_inputs += ["-i", watermark_png]
+                    intro_idx = wm_idx + 1
+                    png_inputs += ["-i", intro_png]
+
+                    # Watermark: top-right, entire segment
+                    filter_parts.append(
+                        f"{prev}[{wm_idx}:v]overlay="
+                        f"x=W-w-20:y=20[wm]"
+                    )
+                    prev = "[wm]"
+
+                    # Intro: center, only if segment overlaps 0-10s
+                    # (times relative to segment start)
+                    intro_s = max(0 - ps, 0)
+                    intro_e = min(10 - ps, pdur)
+                    if intro_e > intro_s + 0.1:
+                        filter_parts.append(
+                            f"{prev}[{intro_idx}:v]overlay="
+                            f"x=(W-w)/2:y=(H-h)/2-40:"
+                            f"enable='between(t,{intro_s:.3f},{intro_e:.3f})'"
+                            f"[vout]"
+                        )
+                    else:
+                        filter_parts.append(f"{prev}null[vout]")
 
                     run_ffmpeg_simple([
                         "ffmpeg", "-y", "-hide_banner",
